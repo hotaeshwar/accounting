@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.responses import FileResponse
-from typing import Optional, List
-from pydantic import BaseModel
+from typing import Optional, List, Literal
+from pydantic import BaseModel, validator
 from datetime import datetime, date
 import pandas as pd
 import sqlite3
@@ -10,6 +10,7 @@ from pathlib import Path
 import tempfile
 import os
 import shutil
+from enum import Enum
 
 # Create app
 app = FastAPI(title="Simple Office Accounting API")
@@ -23,17 +24,44 @@ DATABASE_PATH = DATABASE_DIR / "accounting.db"
 EXPORTS_DIR = Path("./exports")
 EXPORTS_DIR.mkdir(exist_ok=True)
 
+# Define office categories as an Enum
+class OfficeCategory(str, Enum):
+    OFFICE_SUPPLIES = "Office Supplies"
+    RENT = "Rent"
+    UTILITIES = "Utilities"
+    SALARY = "Salary"
+    TRAVEL = "Travel"
+    EQUIPMENT = "Equipment"
+    SOFTWARE = "Software"
+    MARKETING = "Marketing"
+    INSURANCE = "Insurance"
+    TAXES = "Taxes"
+    MAINTENANCE = "Maintenance"
+    TELECOMMUNICATIONS = "Telecommunications"
+    CONSULTING = "Consulting"
+    LEGAL = "Legal"
+    MISCELLANEOUS = "Miscellaneous"
+
 # Models for request/response
 class EntryBase(BaseModel):
     date: str
     client: str
     description: str
-    category: str  # Now will store specific categories like "Office Supplies", "Rent", etc.
+    category: str  # Will validate against OfficeCategory
     amount: float
     payment: str
     tax: float = 0.0
     notes: str = ""
     is_income: bool = False  # New field to distinguish income from expenses
+    
+    # Validate that category is one of the predefined categories
+    @validator('category')
+    def validate_category(cls, v):
+        try:
+            return OfficeCategory(v)
+        except ValueError:
+            # Allow custom categories, but warn user
+            return v
 
 class EntryCreate(EntryBase):
     pass
@@ -72,22 +100,38 @@ class WorkAssignment(WorkAssignmentBase):
 def init_db():
     conn = sqlite3.connect(DATABASE_PATH)
     cursor = conn.cursor()
-    cursor.execute('''
-    CREATE TABLE IF NOT EXISTS entries (
-        id TEXT PRIMARY KEY,
-        date TEXT NOT NULL,
-        invoice TEXT NOT NULL,
-        client TEXT,
-        description TEXT NOT NULL,
-        category TEXT,
-        amount REAL NOT NULL,
-        payment TEXT,
-        tax REAL,
-        notes TEXT,
-        month TEXT,
-        is_income BOOLEAN DEFAULT 0
-    )
-    ''')
+    
+    # Check if entries table exists
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='entries'")
+    table_exists = cursor.fetchone() is not None
+    
+    if not table_exists:
+        # Create entries table with is_income column
+        cursor.execute('''
+        CREATE TABLE entries (
+            id TEXT PRIMARY KEY,
+            date TEXT NOT NULL,
+            invoice TEXT NOT NULL,
+            client TEXT,
+            description TEXT NOT NULL,
+            category TEXT,
+            amount REAL NOT NULL,
+            payment TEXT,
+            tax REAL,
+            notes TEXT,
+            month TEXT,
+            is_income BOOLEAN DEFAULT 0
+        )
+        ''')
+    else:
+        # Check if is_income column exists in entries table
+        cursor.execute("PRAGMA table_info(entries)")
+        columns = cursor.fetchall()
+        column_names = [column[1] for column in columns]
+        
+        # Add is_income column if it doesn't exist
+        if 'is_income' not in column_names:
+            cursor.execute("ALTER TABLE entries ADD COLUMN is_income BOOLEAN DEFAULT 0")
     
     # Table to track last month cleared
     cursor.execute('''
@@ -342,6 +386,12 @@ async def get_entries(db: sqlite3.Connection = Depends(get_db)):
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
+# New endpoint to get available categories
+@app.get("/api/categories/")
+async def get_categories():
+    """Get list of predefined office categories"""
+    return {"categories": [category.value for category in OfficeCategory]}
 
 # 3. Download Excel Endpoint
 @app.get("/api/download-excel/")
