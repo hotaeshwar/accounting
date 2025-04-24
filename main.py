@@ -1,31 +1,40 @@
-from fastapi import FastAPI, HTTPException, Depends
-from fastapi.responses import FileResponse
-from typing import Optional, List, Literal
-from pydantic import BaseModel, validator
-from datetime import datetime, date
-import pandas as pd
-import sqlite3
-import uuid
-from pathlib import Path
-import tempfile
-import os
-import shutil
+from fastapi import FastAPI, Depends, HTTPException, status, Header
+from fastapi.responses import FileResponse, JSONResponse
+from pydantic import BaseModel
+from typing import List, Optional, Dict, Any, Union
 from enum import Enum
+from datetime import datetime, timedelta
+import sqlite3
+import os
+import jwt
+import pandas as pd
+import uuid
+import calendar
+from fastapi.middleware.cors import CORSMiddleware
+# Constants
+DATABASE_NAME = "expense_tracker.db"
+SECRET_KEY = "09d25e094faa6ca2556c818166b7a9563b93f7099f6f0f4caa6cf63b88e8d3e7"
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
+EXCEL_EXPORT_DIRECTORY = "exports"
 
-# Create app
-app = FastAPI(title="Simple Office Accounting API")
+# Create exports directory if it doesn't exist
+if not os.path.exists(EXCEL_EXPORT_DIRECTORY):
+    os.makedirs(EXCEL_EXPORT_DIRECTORY)
 
-# Create database directory
-DATABASE_DIR = Path("./data")
-DATABASE_DIR.mkdir(exist_ok=True)
-DATABASE_PATH = DATABASE_DIR / "accounting.db"
-
-# Create exports directory for preserving Excel files
-EXPORTS_DIR = Path("./exports")
-EXPORTS_DIR.mkdir(exist_ok=True)
-
-# Define office categories as an Enum
-class OfficeCategory(str, Enum):
+# Initialize FastAPI app
+app = FastAPI(title="Office Expense Tracker API",
+              description="API for tracking office expenses with admin and guest user roles")
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173"],  # React Vite's default port
+    allow_credentials=True,
+    allow_methods=["*"],  # Allow all methods (GET, POST, PUT, DELETE, etc.)
+    allow_headers=["*"],  # Allow all headers
+)
+# Define expense categories
+class ExpenseCategory(str, Enum):
     OFFICE_SUPPLIES = "Office Supplies"
     RENT = "Rent"
     UTILITIES = "Utilities"
@@ -42,605 +51,804 @@ class OfficeCategory(str, Enum):
     LEGAL = "Legal"
     MISCELLANEOUS = "Miscellaneous"
 
-# Models for request/response
-class EntryBase(BaseModel):
-    date: str
-    client: str
-    description: str
-    category: str  # Will validate against OfficeCategory
-    amount: float
-    payment: str
-    tax: float = 0.0
-    notes: str = ""
-    is_income: bool = False  # New field to distinguish income from expenses
-    
-    # Validate that category is one of the predefined categories
-    @validator('category')
-    def validate_category(cls, v):
-        try:
-            return OfficeCategory(v)
-        except ValueError:
-            # Allow custom categories, but warn user
-            return v
-
-class EntryCreate(EntryBase):
-    pass
-
-class Entry(EntryBase):
-    id: str
-    invoice: str
-    month: str
-
-class EntriesResponse(BaseModel):
-    entries: List[Entry]
-    total_income: float
-    total_expense: float
-    total_tax: float
-
-# New model for salesperson work assignments
-class WorkAssignmentBase(BaseModel):
-    date: str
-    salesperson: str
-    client: str
-    task: str
-    status: str = "Pending"  # Default status
-    due_date: str
-    priority: str = "Medium"
-    notes: str = ""
-
-class WorkAssignmentCreate(WorkAssignmentBase):
-    pass
-
-class WorkAssignment(WorkAssignmentBase):
-    id: str
-    created_on: str
-    month: str
+# Define user role
+class UserRole(str, Enum):
+    ADMIN = "admin"
+    GUEST = "guest"
 
 # Database setup
 def init_db():
-    conn = sqlite3.connect(DATABASE_PATH)
+    conn = sqlite3.connect(DATABASE_NAME)
     cursor = conn.cursor()
-    
-    # Check if entries table exists
-    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='entries'")
-    table_exists = cursor.fetchone() is not None
-    
-    if not table_exists:
-        # Create entries table with is_income column
-        cursor.execute('''
-        CREATE TABLE entries (
-            id TEXT PRIMARY KEY,
-            date TEXT NOT NULL,
-            invoice TEXT NOT NULL,
-            client TEXT,
-            description TEXT NOT NULL,
-            category TEXT,
-            amount REAL NOT NULL,
-            payment TEXT,
-            tax REAL,
-            notes TEXT,
-            month TEXT,
-            is_income BOOLEAN DEFAULT 0
-        )
-        ''')
-    else:
-        # Check if is_income column exists in entries table
-        cursor.execute("PRAGMA table_info(entries)")
-        columns = cursor.fetchall()
-        column_names = [column[1] for column in columns]
-        
-        # Add is_income column if it doesn't exist
-        if 'is_income' not in column_names:
-            cursor.execute("ALTER TABLE entries ADD COLUMN is_income BOOLEAN DEFAULT 0")
-    
-    # Table to track last month cleared
+
+    # Check if users table exists and has password column
+    has_password_column = False
+    try:
+        cursor.execute("PRAGMA table_info(users)")
+        columns = [info[1] for info in cursor.fetchall()]
+        has_password_column = 'password' in columns
+    except sqlite3.OperationalError:
+        # Table doesn't exist
+        pass
+
+    # If the table exists but doesn't have the password column, it's better to
+    # recreate the database to ensure all tables have the correct schema
+    if os.path.exists(DATABASE_NAME) and not has_password_column:
+        conn.close()
+        os.remove(DATABASE_NAME)
+        conn = sqlite3.connect(DATABASE_NAME)
+        cursor = conn.cursor()
+        print("Recreating database with correct schema")
+
+    # Users table
     cursor.execute('''
-    CREATE TABLE IF NOT EXISTS month_tracking (
-        id INTEGER PRIMARY KEY,
-        last_cleared_month TEXT
+    CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT UNIQUE NOT NULL,
+        password TEXT NOT NULL,
+        role TEXT NOT NULL
     )
     ''')
-    
-    # New table for salesperson work assignments
+
+    # Expenses table
     cursor.execute('''
-    CREATE TABLE IF NOT EXISTS work_assignments (
-        id TEXT PRIMARY KEY,
-        date TEXT NOT NULL,
-        salesperson TEXT NOT NULL,
-        client TEXT NOT NULL,
-        task TEXT NOT NULL,
-        status TEXT NOT NULL,
-        due_date TEXT NOT NULL,
-        priority TEXT NOT NULL,
-        notes TEXT,
-        created_on TEXT NOT NULL,
-        month TEXT NOT NULL
+    CREATE TABLE IF NOT EXISTS expenses (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        invoice_id TEXT UNIQUE NOT NULL,
+        user_id INTEGER NOT NULL,
+        amount REAL NOT NULL,
+        category TEXT NOT NULL,
+        description TEXT,
+        date_created TEXT NOT NULL,
+        FOREIGN KEY (user_id) REFERENCES users (id)
     )
     ''')
-    
+
+    # Archived expenses table for historical data
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS archived_expenses (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        invoice_id TEXT UNIQUE NOT NULL,
+        user_id INTEGER NOT NULL,
+        amount REAL NOT NULL,
+        category TEXT NOT NULL,
+        description TEXT,
+        date_created TEXT NOT NULL,
+        archive_date TEXT NOT NULL
+    )
+    ''')
+
+    # Income table
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS income (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        description TEXT,
+        amount REAL NOT NULL,
+        date_created TEXT NOT NULL
+    )
+    ''')
+
     conn.commit()
     conn.close()
 
-# Thread-safe database connection
-def get_db():
-    conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
+# Initialize database
+init_db()
+
+# Pydantic models
+class UserCreate(BaseModel):
+    username: str
+    password: str
+    role: UserRole
+
+class User(BaseModel):
+    id: int
+    username: str
+    role: UserRole
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+    role: Optional[UserRole] = None  # Optional role for login
+
+class TokenData(BaseModel):
+    access_token: str
+    token_type: str
+    user_role: str
+
+class TokenResponse(BaseModel):
+    success: bool = True
+    data: TokenData
+    message: str = "Login successful"
+
+class ExpenseBase(BaseModel):
+    amount: float
+    category: ExpenseCategory
+    description: Optional[str] = None
+
+class ExpenseCreate(ExpenseBase):
+    pass
+
+class Expense(ExpenseBase):
+    id: int
+    invoice_id: str
+    user_id: int
+    date_created: str
+
+class ResponseModel(BaseModel):
+    success: bool
+    data: Optional[Any] = None
+    message: Optional[str] = None
+
+class CategoryItem(BaseModel):
+    key: str
+    name: str
+
+class CategoriesResponse(BaseModel):
+    success: bool = True
+    data: List[CategoryItem]
+    message: str = "Categories retrieved successfully"
+
+class IncomeCreate(BaseModel):
+    description: str
+    amount: float
+
+class ProfitLossData(BaseModel):
+    total_income: float
+    total_expenses: float
+    net_profit_loss: float
+    expenses_by_category: Dict[str, float]
+
+# User authentication functions
+def get_user(username: str):
+    conn = sqlite3.connect(DATABASE_NAME)
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, username, password, role FROM users WHERE username = ?", (username,))
+    user_data = cursor.fetchone()
+    conn.close()
+
+    if user_data:
+        return {"id": user_data[0], "username": user_data[1], "password": user_data[2], "role": user_data[3]}
+    return None
+
+def authenticate_user(username: str, password: str, role: Optional[UserRole] = None):
+    user = get_user(username)
+    if not user or user["password"] != password:
+        return False
+
+    # If role is specified, check if user has that role
+    if role and user["role"] != role:
+        return False
+
+    return user
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+# Authentication dependency that accepts tokens from multiple sources
+async def get_current_user(
+    authorization: Optional[str] = Header(None),
+    x: Optional[str] = None,
+):
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+    # Get token from authorization header
+    token = None
+    if authorization and authorization.startswith("Bearer "):
+        token = authorization.split("Bearer ")[1]
+
+    # If not in header, try query parameter
+    elif x:
+        if x.startswith("Bearer "):
+            token = x.split("Bearer ")[1]
+        else:
+            token = x  # Try using the raw value
+
+    if not token:
+        raise credentials_exception
+
     try:
-        yield conn
+        # Decode and validate the token
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username: str = payload.get("sub")
+        user_id: int = payload.get("user_id")
+        role: str = payload.get("role")
+
+        if username is None or user_id is None:
+            raise credentials_exception
+
+    except jwt.PyJWTError as e:
+        # Any JWT decode error results in authentication failure
+        print(f"JWT decode error: {str(e)}")
+        raise credentials_exception
+
+    # Validate that the user exists in the database
+    user = get_user(username)
+    if user is None:
+        raise credentials_exception
+
+    return user
+
+async def get_current_admin(current_user: dict = Depends(get_current_user)):
+    if current_user["role"] != UserRole.ADMIN:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Not enough permissions"
+        )
+    return current_user
+
+# Helper functions
+def generate_invoice_id():
+    # Generate a timestamp-based UUID for invoice to ensure uniqueness
+    timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+    unique_id = str(uuid.uuid4()).split('-')[0]  # Use part of UUID for brevity
+    return f"INV-{timestamp}-{unique_id}"
+
+# API endpoints
+@app.post("/register", response_model=ResponseModel)
+async def register(user: UserCreate):
+    db_user = get_user(user.username)
+    if db_user:
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content={"success": False, "message": "Username already registered"}
+        )
+
+    conn = sqlite3.connect(DATABASE_NAME)
+    cursor = conn.cursor()
+    try:
+        cursor.execute("INSERT INTO users (username, password, role) VALUES (?, ?, ?)",
+                    (user.username, user.password, user.role))
+        user_id = cursor.lastrowid
+        conn.commit()
+
+        user_data = {"id": user_id, "username": user.username, "role": user.role}
+        return {"success": True, "data": user_data, "message": "User registered successfully"}
+    except Exception as e:
+        conn.rollback()
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"success": False, "message": f"Database error: {str(e)}"}
+        )
     finally:
         conn.close()
 
-# Generate a new invoice number
-def generate_invoice_number(db_conn, date_str):
-    try:
-        date_obj = datetime.strptime(date_str, '%Y-%m-%d')
-        year = date_obj.year
-        month = date_obj.month
-        
-        prefix = f"{year}{month:02d}-"
-        
-        cursor = db_conn.cursor()
-        cursor.execute("SELECT invoice FROM entries WHERE invoice LIKE ?", (prefix + "%",))
-        existing_invoices = cursor.fetchall()
-        
-        max_num = 0
-        for row in existing_invoices:
-            invoice = row["invoice"]
-            if invoice.startswith(prefix):
-                try:
-                    num = int(invoice[len(prefix):])
-                    max_num = max(max_num, num)
-                except ValueError:
-                    pass
-        
-        return f"{prefix}{max_num + 1:04d}"
-    except Exception as e:
-        raise RuntimeError(f"Failed to generate invoice number: {str(e)}")
-
-# Get current month in "Month Year" format
-def get_current_month():
-    return datetime.now().strftime('%B %Y')
-
-# Check if month has changed and clear old entries
-async def check_month_transition(db: sqlite3.Connection):
-    current_month = get_current_month()
-    cursor = db.cursor()
-    
-    # Check what was the last cleared month
-    cursor.execute("SELECT last_cleared_month FROM month_tracking LIMIT 1")
-    row = cursor.fetchone()
-    
-    last_cleared_month = row["last_cleared_month"] if row else None
-    
-    # If first run or month has changed
-    if not last_cleared_month or last_cleared_month != current_month:
-        # Before clearing, export previous month's data
-        if last_cleared_month:
-            # Get entries from previous month
-            cursor.execute("SELECT * FROM entries")
-            rows = cursor.fetchall()
-            
-            if rows:
-                # Convert to DataFrame
-                entries = [dict(row) for row in rows]
-                df = pd.DataFrame(entries)
-                
-                # Save to Excel
-                date_parts = last_cleared_month.split()
-                filename = f"accounting_{date_parts[1]}_{datetime.strptime(date_parts[0], '%B').month:02d}.xlsx"
-                export_path = EXPORTS_DIR / filename
-                
-                with pd.ExcelWriter(export_path, engine="xlsxwriter") as writer:
-                    df.to_excel(writer, sheet_name=last_cleared_month, index=False)
-                    
-                    # Format headers
-                    workbook = writer.book
-                    worksheet = writer.sheets[last_cleared_month]
-                    
-                    header_format = workbook.add_format({
-                        'bold': True,
-                        'text_wrap': True,
-                        'valign': 'top',
-                        'bg_color': '#D9E1F2',
-                        'border': 1
-                    })
-                    
-                    for col_num, value in enumerate(df.columns.values):
-                        worksheet.write(0, col_num, value, header_format)
-                        
-                    # Set column widths
-                    for i, col in enumerate(df.columns):
-                        worksheet.set_column(i, i, max(len(col) + 2, 15))
-            
-            # Also get and export work assignments from previous month
-            cursor.execute("SELECT * FROM work_assignments")
-            work_rows = cursor.fetchall()
-            
-            if work_rows:
-                # Convert to DataFrame
-                work_entries = [dict(row) for row in work_rows]
-                work_df = pd.DataFrame(work_entries)
-                
-                # Save to Excel
-                work_filename = f"work_assignments_{date_parts[1]}_{datetime.strptime(date_parts[0], '%B').month:02d}.xlsx"
-                work_export_path = EXPORTS_DIR / work_filename
-                
-                with pd.ExcelWriter(work_export_path, engine="xlsxwriter") as writer:
-                    work_df.to_excel(writer, sheet_name=last_cleared_month, index=False)
-                    
-                    # Format headers
-                    workbook = writer.book
-                    worksheet = writer.sheets[last_cleared_month]
-                    
-                    header_format = workbook.add_format({
-                        'bold': True,
-                        'text_wrap': True,
-                        'valign': 'top',
-                        'bg_color': '#D9E1F2',
-                        'border': 1
-                    })
-                    
-                    for col_num, value in enumerate(work_df.columns.values):
-                        worksheet.write(0, col_num, value, header_format)
-                        
-                    # Set column widths
-                    for i, col in enumerate(work_df.columns):
-                        worksheet.set_column(i, i, max(len(col) + 2, 15))
-            
-            # Clear all entries
-            cursor.execute("DELETE FROM entries")
-            cursor.execute("DELETE FROM work_assignments")
-        
-        # Update last cleared month
-        if not last_cleared_month:
-            cursor.execute("INSERT INTO month_tracking (last_cleared_month) VALUES (?)", (current_month,))
-        else:
-            cursor.execute("UPDATE month_tracking SET last_cleared_month = ?", (current_month,))
-            
-        db.commit()
-
-# Initialize database on startup
-@app.on_event("startup")
-async def startup_event():
-    init_db()
-    # Open connection to check month transition
-    conn = sqlite3.connect(DATABASE_PATH)
-    conn.row_factory = sqlite3.Row
-    await check_month_transition(conn)
-    conn.close()
-
-# 1. Add Entry Endpoint
-@app.post("/api/entries/")
-async def add_entry(entry_data: EntryCreate, db: sqlite3.Connection = Depends(get_db)):
-    """Add a new entry with auto-generated ID and invoice"""
-    try:
-        # Check if month transition needed
-        await check_month_transition(db)
-        
-        # Generate unique ID
-        entry_id = str(uuid.uuid4())
-            
-        # Set month to current month
-        month = get_current_month()
-        
-        # Auto-generate invoice number
-        invoice = generate_invoice_number(db, entry_data.date)
-            
-        cursor = db.cursor()
-        cursor.execute(
-            """
-            INSERT INTO entries (id, date, invoice, client, description, category, 
-                               amount, payment, tax, notes, month, is_income)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (entry_id, entry_data.date, invoice, entry_data.client, entry_data.description,
-             entry_data.category, entry_data.amount, entry_data.payment, entry_data.tax, 
-             entry_data.notes, month, 1 if entry_data.is_income else 0)
+@app.post("/login", response_model=TokenResponse)
+async def login(login_data: LoginRequest):
+    user = authenticate_user(login_data.username, login_data.password, login_data.role)
+    if not user:
+        return JSONResponse(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            content={
+                "success": False,
+                "message": "Invalid credentials or role"
+            }
         )
-        db.commit()
-        return {"success": True, "id": entry_id, "invoice": invoice}
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=f"Failed to add entry: {str(e)}")
 
-# 2. Get Entries Endpoint
-@app.get("/api/entries/")
-async def get_entries(db: sqlite3.Connection = Depends(get_db)):
-    """Get all entries for the current month"""
-    try:
-        # Check if month transition needed
-        await check_month_transition(db)
-        
-        cursor = db.cursor()
-        cursor.execute("SELECT * FROM entries")
-        rows = cursor.fetchall()
-        
-        entries = []
-        total_income = 0.0
-        total_expense = 0.0
-        total_tax = 0.0
-        
-        for row in rows:
-            entry = dict(row)
-            entries.append(entry)
-            
-            # Calculate totals based on is_income flag
-            amount = float(entry["amount"])
-            tax = float(entry["tax"]) if entry["tax"] else 0.0
-            
-            if entry["is_income"]:
-                total_income += amount
-            else:
-                total_expense += amount
-                
-            total_tax += tax
-        
-        return {
-            "month": get_current_month(),
-            "entries": entries,
-            "total_income": total_income,
-            "total_expense": total_expense,
-            "total_tax": total_tax,
-            "categories": {entry["category"]: sum(float(e["amount"]) for e in entries if e["category"] == entry["category"]) 
-                        for entry in entries if entry["category"]}
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": user["username"], "user_id": user["id"], "role": user["role"]},
+        expires_delta=access_token_expires
+    )
 
-# New endpoint to get available categories
-@app.get("/api/categories/")
+    token_data = {
+        "access_token": access_token,
+        "token_type": "bearer",
+        "user_role": user["role"]
+    }
+
+    return {
+        "success": True,
+        "data": token_data,
+        "message": "Login successful"
+    }
+
+@app.get("/categories", response_model=CategoriesResponse)
 async def get_categories():
-    """Get list of predefined office categories"""
-    return {"categories": [category.value for category in OfficeCategory]}
+    # No authentication required for fetching categories
+    categories = [{"key": category.name, "name": category.value} for category in ExpenseCategory]
+    return {
+        "success": True,
+        "data": categories,
+        "message": "Categories retrieved successfully"
+    }
 
-# 3. Download Excel Endpoint
-@app.get("/api/download-excel/")
-async def download_excel(db: sqlite3.Connection = Depends(get_db)):
-    """Generate and download Excel file with current month's data"""
-    try:
-        # Check if month transition needed
-        await check_month_transition(db)
-        
-        current_month = get_current_month()
-        
-        cursor = db.cursor()
-        cursor.execute("SELECT * FROM entries")
-        rows = cursor.fetchall()
-        
-        if not rows:
-            raise HTTPException(status_code=404, detail=f"No data available for current month")
-        
-        # Convert to DataFrame
-        entries = [dict(row) for row in rows]
-        df = pd.DataFrame(entries)
-        
-        # Create temporary file
-        with tempfile.NamedTemporaryFile(suffix='.xlsx', delete=False) as tmp:
-            temp_filename = tmp.name
-            
-        # Save to Excel with formatting
-        with pd.ExcelWriter(temp_filename, engine="xlsxwriter") as writer:
-            df.to_excel(writer, sheet_name=current_month, index=False)
-            
-            # Get workbook and worksheet objects
-            workbook = writer.book
-            worksheet = writer.sheets[current_month]
-            
-            # Add formatting
-            header_format = workbook.add_format({
-                'bold': True,
-                'text_wrap': True,
-                'valign': 'top',
-                'bg_color': '#D9E1F2',
-                'border': 1
-            })
-            
-            # Apply header format
-            for col_num, value in enumerate(df.columns.values):
-                worksheet.write(0, col_num, value, header_format)
-                
-            # Set column widths
-            for i, col in enumerate(df.columns):
-                worksheet.set_column(i, i, max(len(col) + 2, 15))
-        
-        # Return the file
-        date_parts = current_month.split()
-        filename = f"accounting_{date_parts[1]}_{datetime.strptime(date_parts[0], '%B').month:02d}.xlsx"
-        
-        return FileResponse(
-            path=temp_filename,
-            filename=filename,
-            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to generate Excel file: {str(e)}")
+@app.post("/expenses", response_model=ResponseModel)
+async def create_expense(expense: ExpenseCreate, current_user: dict = Depends(get_current_user)):
+    invoice_id = generate_invoice_id()
+    date_created = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-# 4. Add Salesperson Work Assignment Endpoint
-@app.post("/api/work-assignments/")
-async def add_work_assignment(work_data: WorkAssignmentCreate, db: sqlite3.Connection = Depends(get_db)):
-    """Add a new work assignment for a salesperson"""
+    conn = sqlite3.connect(DATABASE_NAME)
+    cursor = conn.cursor()
     try:
-        # Check if month transition needed
-        await check_month_transition(db)
-        
-        # Generate unique ID
-        assignment_id = str(uuid.uuid4())
-            
-        # Set month to current month
-        month = get_current_month()
-        
-        # Set creation timestamp
-        created_on = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            
-        cursor = db.cursor()
         cursor.execute(
-            """
-            INSERT INTO work_assignments (id, date, salesperson, client, task, 
-                                        status, due_date, priority, notes, created_on, month)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (assignment_id, work_data.date, work_data.salesperson, work_data.client, 
-             work_data.task, work_data.status, work_data.due_date, work_data.priority,
-             work_data.notes, created_on, month)
+            "INSERT INTO expenses (invoice_id, user_id, amount, category, description, date_created) VALUES (?, ?, ?, ?, ?, ?)",
+            (invoice_id, current_user["id"], expense.amount, expense.category, expense.description, date_created)
         )
-        db.commit()
-        return {"success": True, "id": assignment_id, "created_on": created_on}
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=f"Failed to add work assignment: {str(e)}")
+        expense_id = cursor.lastrowid
+        conn.commit()
 
-# 5. Get Work Assignments Endpoint
-@app.get("/api/work-assignments/")
-async def get_work_assignments(salesperson: Optional[str] = None, db: sqlite3.Connection = Depends(get_db)):
-    """Get all work assignments for the current month, optionally filtered by salesperson"""
-    try:
-        # Check if month transition needed
-        await check_month_transition(db)
-        
-        cursor = db.cursor()
-        
-        if salesperson:
-            cursor.execute("SELECT * FROM work_assignments WHERE salesperson = ? ORDER BY priority, due_date", 
-                          (salesperson,))
-        else:
-            cursor.execute("SELECT * FROM work_assignments ORDER BY salesperson, priority, due_date")
-            
-        rows = cursor.fetchall()
-        
-        assignments = []
-        for row in rows:
-            assignment = dict(row)
-            assignments.append(assignment)
-        
-        # Group assignments by status
-        status_groups = {}
-        for assignment in assignments:
-            status = assignment["status"]
-            if status not in status_groups:
-                status_groups[status] = []
-            status_groups[status].append(assignment)
-        
+        expense_data = {
+            "id": expense_id,
+            "invoice_id": invoice_id,
+            "user_id": current_user["id"],
+            "amount": expense.amount,
+            "category": expense.category,
+            "description": expense.description,
+            "date_created": date_created
+        }
+
         return {
-            "month": get_current_month(),
-            "assignments": assignments,
-            "status_summary": {status: len(items) for status, items in status_groups.items()},
-            "total_assignments": len(assignments)
+            "success": True,
+            "data": expense_data,
+            "message": f"Expense created successfully with invoice ID: {invoice_id}"
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
-
-# 6. Update Work Assignment Status Endpoint
-@app.put("/api/work-assignments/{assignment_id}")
-async def update_work_assignment(
-    assignment_id: str, 
-    status: str, 
-    notes: Optional[str] = None,
-    db: sqlite3.Connection = Depends(get_db)
-):
-    """Update the status and optionally notes of a work assignment"""
-    try:
-        cursor = db.cursor()
-        
-        # Check if assignment exists
-        cursor.execute("SELECT * FROM work_assignments WHERE id = ?", (assignment_id,))
-        assignment = cursor.fetchone()
-        
-        if not assignment:
-            raise HTTPException(status_code=404, detail=f"Work assignment with ID {assignment_id} not found")
-        
-        # Update the assignment
-        if notes:
-            cursor.execute(
-                "UPDATE work_assignments SET status = ?, notes = ? WHERE id = ?",
-                (status, notes, assignment_id)
-            )
-        else:
-            cursor.execute(
-                "UPDATE work_assignments SET status = ? WHERE id = ?",
-                (status, assignment_id)
-            )
-            
-        db.commit()
-        
-        return {"success": True, "message": f"Work assignment updated successfully"}
-    except HTTPException:
-        raise
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=f"Failed to update work assignment: {str(e)}")
-
-# 7. Download Work Assignments Excel Endpoint
-@app.get("/api/download-work-excel/")
-async def download_work_excel(salesperson: Optional[str] = None, db: sqlite3.Connection = Depends(get_db)):
-    """Generate and download Excel file with current month's work assignments"""
-    try:
-        # Check if month transition needed
-        await check_month_transition(db)
-        
-        current_month = get_current_month()
-        
-        cursor = db.cursor()
-        
-        if salesperson:
-            cursor.execute("SELECT * FROM work_assignments WHERE salesperson = ?", (salesperson,))
-        else:
-            cursor.execute("SELECT * FROM work_assignments")
-            
-        rows = cursor.fetchall()
-        
-        if not rows:
-            raise HTTPException(status_code=404, detail=f"No work assignments available for current month")
-        
-        # Convert to DataFrame
-        assignments = [dict(row) for row in rows]
-        df = pd.DataFrame(assignments)
-        
-        # Create temporary file
-        with tempfile.NamedTemporaryFile(suffix='.xlsx', delete=False) as tmp:
-            temp_filename = tmp.name
-            
-        # Save to Excel with formatting
-        with pd.ExcelWriter(temp_filename, engine="xlsxwriter") as writer:
-            df.to_excel(writer, sheet_name=current_month, index=False)
-            
-            # Get workbook and worksheet objects
-            workbook = writer.book
-            worksheet = writer.sheets[current_month]
-            
-            # Add formatting
-            header_format = workbook.add_format({
-                'bold': True,
-                'text_wrap': True,
-                'valign': 'top',
-                'bg_color': '#D9E1F2',
-                'border': 1
-            })
-            
-            # Apply header format
-            for col_num, value in enumerate(df.columns.values):
-                worksheet.write(0, col_num, value, header_format)
-                
-            # Set column widths
-            for i, col in enumerate(df.columns):
-                worksheet.set_column(i, i, max(len(col) + 2, 15))
-        
-        # Return the file
-        date_parts = current_month.split()
-        filename = f"work_assignments_{date_parts[1]}_{datetime.strptime(date_parts[0], '%B').month:02d}.xlsx"
-        if salesperson:
-            filename = f"{salesperson}_{filename}"
-        
-        return FileResponse(
-            path=temp_filename,
-            filename=filename,
-            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        conn.rollback()
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"success": False, "message": f"Database error: {str(e)}"}
         )
-    except HTTPException:
-        raise
+    finally:
+        conn.close()
+
+@app.get("/expenses/my", response_model=ResponseModel)
+async def list_my_expenses(current_user: dict = Depends(get_current_user)):
+    conn = sqlite3.connect(DATABASE_NAME)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute(
+            "SELECT id, invoice_id, user_id, amount, category, description, date_created FROM expenses WHERE user_id = ?",
+            (current_user["id"],)
+        )
+        expenses = []
+        for row in cursor.fetchall():
+            expenses.append(dict(row))
+
+        return {"success": True, "data": expenses}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to generate Excel file: {str(e)}")
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"success": False, "message": f"Database error: {str(e)}"}
+        )
+    finally:
+        conn.close()
+
+@app.get("/expenses/all", response_model=ResponseModel)
+async def list_all_expenses(current_user: dict = Depends(get_current_admin)):
+    conn = sqlite3.connect(DATABASE_NAME)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute(
+            "SELECT e.id, e.invoice_id, e.user_id, e.amount, e.category, e.description, e.date_created, u.username FROM expenses e JOIN users u ON e.user_id = u.id"
+        )
+        expenses = []
+        for row in cursor.fetchall():
+            expenses.append(dict(row))
+
+        return {"success": True, "data": expenses}
+    except Exception as e:
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"success": False, "message": f"Database error: {str(e)}"}
+        )
+    finally:
+        conn.close()
+
+@app.get("/export/current-month", response_model=ResponseModel)
+async def export_current_month_expenses(current_user: dict = Depends(get_current_user)):
+    # Only admins can manually trigger export
+    if current_user["role"] != UserRole.ADMIN:
+        return JSONResponse(
+            status_code=status.HTTP_403_FORBIDDEN,
+            content={"success": False, "message": "Not enough permissions"}
+        )
+
+    try:
+        current_date = datetime.now()
+        filename = export_expenses_to_excel(current_date.year, current_date.month)
+
+        return {
+            "success": True,
+            "data": {"filename": os.path.basename(filename)},
+            "message": "Report generated successfully"
+        }
+    except Exception as e:
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"success": False, "message": f"Export error: {str(e)}"}
+        )
+
+@app.get("/download/report/{filename}")
+async def download_report(filename: str, current_user: dict = Depends(get_current_admin)):
+    filepath = os.path.join(EXCEL_EXPORT_DIRECTORY, filename)
+    if not os.path.exists(filepath):
+        return JSONResponse(
+            status_code=status.HTTP_404_NOT_FOUND,
+            content={"success": False, "message": "Report file not found"}
+        )
+
+    return FileResponse(
+        path=filepath,
+        filename=filename,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+
+@app.get("/invoice/{invoice_id}", response_model=ResponseModel)
+async def get_invoice_by_id(invoice_id: str, current_user: dict = Depends(get_current_user)):
+    conn = sqlite3.connect(DATABASE_NAME)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    try:
+        # Check if expense exists
+        cursor.execute(
+            "SELECT e.*, u.username, u.role FROM expenses e JOIN users u ON e.user_id = u.id WHERE e.invoice_id = ?",
+            (invoice_id,)
+        )
+        expense = cursor.fetchone()
+
+        if not expense:
+            # Check archived expenses
+            cursor.execute(
+                "SELECT * FROM archived_expenses WHERE invoice_id = ?",
+                (invoice_id,)
+            )
+            expense = cursor.fetchone()
+            if not expense:
+                conn.close()
+                return JSONResponse(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    content={"success": False, "message": "Invoice not found"}
+                )
+
+        # Convert to dict
+        expense_dict = dict(expense)
+
+        # Check if user has permission to view this invoice
+        if current_user["role"] != UserRole.ADMIN and expense_dict["user_id"] != current_user["id"]:
+            conn.close()
+            return JSONResponse(
+                status_code=status.HTTP_403_FORBIDDEN,
+                content={"success": False, "message": "Not authorized to view this invoice"}
+            )
+
+        return {"success": True, "data": expense_dict}
+    except Exception as e:
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"success": False, "message": f"Database error: {str(e)}"}
+        )
+    finally:
+        conn.close()
+
+# API endpoint for manual archive operation
+@app.post("/archive/{year}/{month}", response_model=ResponseModel)
+async def archive_month_expenses(year: int, month: int, current_user: dict = Depends(get_current_admin)):
+    try:
+        # Validate month and year
+        if month < 1 or month > 12:
+            return JSONResponse(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                content={"success": False, "message": "Invalid month. Must be between 1-12"}
+            )
+
+        if year < 2000 or year > datetime.now().year:
+            return JSONResponse(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                content={"success": False, "message": f"Invalid year. Must be between 2000-{datetime.now().year}"}
+            )
+
+        # Export to Excel first (also performs archiving)
+        filename = export_expenses_to_excel(year, month)
+
+        return {
+            "success": True,
+            "data": {"filename": os.path.basename(filename)},
+            "message": f"Expenses for {year}-{month:02d} exported and archived successfully"
+        }
+    except Exception as e:
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"success": False, "message": f"Archive operation failed: {str(e)}"}
+        )
+
+# Excel export and archiving functions
+def export_expenses_to_excel(year, month):
+    conn = sqlite3.connect(DATABASE_NAME)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    # Format dates for query
+    start_date = f"{year}-{month:02d}-01"
+    _, last_day = calendar.monthrange(year, month)
+    end_date = f"{year}-{month:02d}-{last_day} 23:59:59"
+
+    # Get expenses for the month
+    cursor.execute(
+        """
+        SELECT e.id, e.invoice_id, e.amount, e.category, e.description, e.date_created,
+               u.username, u.role
+        FROM expenses e
+        JOIN users u ON e.user_id = u.id
+        WHERE e.date_created BETWEEN ? AND ?
+        """,
+        (start_date, end_date)
+    )
+
+    expenses = []
+    for row in cursor.fetchall():
+        expenses.append(dict(row))
+
+    # Create DataFrame for Excel export
+    if expenses:
+        df = pd.DataFrame(expenses)
+
+        # Create Excel writer with formatting
+        filename = f"{EXCEL_EXPORT_DIRECTORY}/expenses_{year}_{month:02d}.xlsx"
+        writer = pd.ExcelWriter(filename, engine='openpyxl')
+
+        # Write data
+        df.to_excel(writer, index=False, sheet_name='Expenses')
+
+        # Get the workbook and worksheet objects
+        workbook = writer.book
+        worksheet = writer.sheets['Expenses']
+
+        # Import openpyxl for Excel color formatting
+        import openpyxl
+        from openpyxl.styles import PatternFill
+
+        # Add color formatting based on user role
+        for idx, row in enumerate(df.itertuples(index=False), start=2):  # Start from row 2 (after header)
+            cell_color = "E6F2FF" if row.role == "guest" else "FFE6E6"  # Light blue for guest, light red for admin
+            for col in range(1, len(df.columns) + 1):
+                cell = worksheet.cell(row=idx, column=col)
+                cell.fill = PatternFill(start_color=cell_color, end_color=cell_color, fill_type="solid")
+
+        # Add total row
+        total_row = len(df) + 2
+        worksheet.cell(row=total_row, column=1, value="Total")
+        worksheet.cell(row=total_row, column=3, value=f"=SUM(C2:C{total_row-1})")
+
+        # Add some formatting
+        for col in worksheet.columns:
+            max_length = 0
+            column = col[0].column_letter
+            for cell in col:
+                try:
+                    if len(str(cell.value)) > max_length:
+                        max_length = len(cell.value)
+                except:
+                    pass
+            adjusted_width = (max_length + 2)
+            worksheet.column_dimensions[column].width = adjusted_width
+
+        # Save the file
+        writer.close()
+
+        # Archive expenses
+        archive_expenses(year, month)
+
+        return filename
+    else:
+        # Create empty Excel file
+        filename = f"{EXCEL_EXPORT_DIRECTORY}/expenses_{year}_{month:02d}_empty.xlsx"
+        pd.DataFrame(columns=['No expenses found for this period']).to_excel(filename, index=False)
+        return filename
+
+def archive_expenses(year, month):
+    conn = sqlite3.connect(DATABASE_NAME)
+    cursor = conn.cursor()
+
+    # Format dates for query
+    start_date = f"{year}-{month:02d}-01"
+    _, last_day = calendar.monthrange(year, month)
+    end_date = f"{year}-{month:02d}-{last_day} 23:59:59"
+    archive_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # Move expenses to archive
+    cursor.execute(
+        """
+        INSERT INTO archived_expenses
+        (invoice_id, user_id, amount, category, description, date_created, archive_date)
+        SELECT invoice_id, user_id, amount, category, description, date_created, ?
+        FROM expenses
+        WHERE date_created BETWEEN ? AND ?
+        """,
+        (archive_date, start_date, end_date)
+    )
+
+    # Delete archived expenses from main table
+    cursor.execute(
+        "DELETE FROM expenses WHERE date_created BETWEEN ? AND ?",
+        (start_date, end_date)
+    )
+
+    conn.commit()
+    conn.close()
+@app.get("/archive/{month}/{year}", response_model=ResponseModel)
+async def get_archived_expenses(month: int, year: int, current_user: dict = Depends(get_current_admin)):
+    """
+    Retrieve archived expenses for a specific month and year.
+    Only admin users can access this endpoint.
+    """
+    try:
+        # Validate month and year
+        if month < 1 or month > 12:
+            return JSONResponse(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                content={"success": False, "message": "Invalid month. Must be between 1-12"}
+            )
+
+        if year < 2000 or year > datetime.now().year:
+            return JSONResponse(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                content={"success": False, "message": f"Invalid year. Must be between 2000-{datetime.now().year}"}
+            )
+
+        # Format dates for query
+        start_date = f"{year}-{month:02d}-01"
+        _, last_day = calendar.monthrange(year, month)
+        end_date = f"{year}-{month:02d}-{last_day} 23:59:59"
+
+        # Connect to database
+        conn = sqlite3.connect(DATABASE_NAME)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+
+        # Retrieve archived expenses for the specified month/year
+        cursor.execute(
+            """
+            SELECT ar.id, ar.invoice_id, ar.user_id, ar.amount, ar.category,
+                   ar.description, ar.date_created, ar.archive_date, u.username
+            FROM archived_expenses ar
+            JOIN users u ON ar.user_id = u.id
+            WHERE ar.date_created BETWEEN ? AND ?
+            ORDER BY ar.date_created
+            """,
+            (start_date, end_date)
+        )
+
+        archived_expenses = []
+        for row in cursor.fetchall():
+            archived_expenses.append(dict(row))
+
+        conn.close()
+
+        if not archived_expenses:
+            return {
+                "success": True,
+                "data": [],
+                "message": f"No archived expenses found for {year}-{month:02d}"
+            }
+
+        return {
+            "success": True,
+            "data": archived_expenses,
+            "message": f"Retrieved {len(archived_expenses)} archived expenses for {year}-{month:02d}"
+        }
+    except Exception as e:
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"success": False, "message": f"This feature is reserved for admin login personnel only"}
+        )
+
+@app.post("/income", response_model=ResponseModel)
+async def create_income(income: IncomeCreate, current_user: dict = Depends(get_current_admin)):
+    """
+    Create an income entry. Only admin users can access this endpoint.
+    """
+    date_created = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    conn = sqlite3.connect(DATABASE_NAME)
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            "INSERT INTO income (description, amount, date_created) VALUES (?, ?, ?)",
+            (income.description, income.amount, date_created)
+        )
+        income_id = cursor.lastrowid
+        conn.commit()
+
+        income_data = {
+            "id": income_id,
+            "description": income.description,
+            "amount": income.amount,
+            "date_created": date_created
+        }
+
+        return {
+            "success": True,
+            "data": income_data,
+            "message": "Income created successfully"
+        }
+    except Exception as e:
+        conn.rollback()
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"success": False, "message": f"Database error: {str(e)}"}
+        )
+    finally:
+        conn.close()
+
+@app.get("/profit-loss/current-month", response_model=ResponseModel)
+async def get_current_month_profit_loss(current_user: dict = Depends(get_current_user)):
+    """
+    Calculate and retrieve profit/loss data for the current month.
+    """
+    now = datetime.now()
+    start_date = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0).strftime("%Y-%m-%d %H:%M:%S")
+    end_date = now.strftime("%Y-%m-%d %H:%M:%S")
+
+    conn = sqlite3.connect(DATABASE_NAME)
+    cursor = conn.cursor()
+
+    try:
+        # Calculate total income
+        cursor.execute(
+            "SELECT SUM(amount) FROM income WHERE date_created BETWEEN ? AND ?",
+            (start_date, end_date)
+        )
+        total_income = cursor.fetchone()[0] or 0.0
+
+        # Calculate total expenses
+        cursor.execute(
+            "SELECT SUM(amount) FROM expenses WHERE date_created BETWEEN ? AND ?",
+            (start_date, end_date)
+        )
+        total_expenses = cursor.fetchone()[0] or 0.0
+
+        # Calculate expenses by category
+        expenses_by_category = {}
+        for category in ExpenseCategory:
+            cursor.execute(
+                "SELECT SUM(amount) FROM expenses WHERE category = ? AND date_created BETWEEN ? AND ?",
+                (category.value, start_date, end_date)
+            )
+            category_total = cursor.fetchone()[0] or 0.0
+            expenses_by_category[category.value] = category_total
+
+        net_profit_loss = total_income - total_expenses
+
+        profit_loss_data = ProfitLossData(
+            total_income=total_income,
+            total_expenses=total_expenses,
+            net_profit_loss=net_profit_loss,
+            expenses_by_category=expenses_by_category
+        )
+
+        return {
+            "success": True,
+            "data": profit_loss_data,
+            "message": "Profit/Loss data retrieved successfully"
+        }
+    except Exception as e:
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"success": False, "message": f"Error retrieving profit/loss data: {str(e)}"}
+        )
+    finally:
+        conn.close()
+
+# Health check endpoint
+@app.get("/health")
+async def health_check():
+    return {"status": "healthy", "success": True}
 
 if __name__ == "__main__":
     import uvicorn
