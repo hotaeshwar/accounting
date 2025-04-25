@@ -738,7 +738,8 @@ import calendar
 from openpyxl.styles import PatternFill
 import os
 
-EXCEL_EXPORT_DIRECTORY = '/root/exports'  # Ensure this is correct
+EXCEL_EXPORT_DIRECTORY = '/root/accounting/exports'
+
 
 def export_expenses_to_excel(year, month):
     try:
