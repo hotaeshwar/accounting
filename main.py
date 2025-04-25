@@ -1,3 +1,5 @@
+import random
+import string
 from fastapi import FastAPI, Depends, HTTPException, status, Header
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
@@ -28,10 +30,7 @@ app = FastAPI(title="Office Expense Tracker API",
 # Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-   allow_origins=[
-        "http://localhost:5173",
-        "https://xautrademeeting.com"
-    ],    # React Vite's default port
+    allow_origins=["https://api.accountsonline.info/", "http://localhost:5173"],  # React Vite's default port
     allow_credentials=True,
     allow_methods=["*"],  # Allow all methods (GET, POST, PUT, DELETE, etc.)
     allow_headers=["*"],  # Allow all headers
@@ -162,6 +161,13 @@ class TokenResponse(BaseModel):
     success: bool = True
     data: TokenData
     message: str = "Login successful"
+class PasswordResetRequest(BaseModel):
+    username: str
+
+class PasswordResetVerify(BaseModel):
+    username: str
+    reset_code: str
+    new_password: str
 
 class ExpenseBase(BaseModel):
     amount: float
@@ -296,6 +302,64 @@ def generate_invoice_id():
     timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
     unique_id = str(uuid.uuid4()).split('-')[0]  # Use part of UUID for brevity
     return f"INV-{timestamp}-{unique_id}"
+# Create a dictionary to store reset codes temporarily (in production, use a database table)
+password_reset_codes = {}
+# Update the get_current_user function to check token validity time
+async def get_current_user(
+    authorization: Optional[str] = Header(None),
+    x: Optional[str] = None,
+):
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+    # Get token from authorization header
+    token = None
+    if authorization and authorization.startswith("Bearer "):
+        token = authorization.split("Bearer ")[1]
+
+    # If not in header, try query parameter
+    elif x:
+        if x.startswith("Bearer "):
+            token = x.split("Bearer ")[1]
+        else:
+            token = x  # Try using the raw value
+
+    if not token:
+        raise credentials_exception
+
+    try:
+        # Decode and validate the token
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username: str = payload.get("sub")
+        user_id: int = payload.get("user_id")
+        role: str = payload.get("role")
+        token_creation_time: float = payload.get("iat", 0)  # Get token creation time
+
+        if username is None or user_id is None:
+            raise credentials_exception
+
+        # Validate that the user exists in the database
+        user = get_user(username)
+        if user is None:
+            raise credentials_exception
+        
+        # Get the user's last password change time from the database
+        # We'll need to add a 'last_password_change' column to track this
+        # For now, we'll rely on token expiration for invalidation
+        
+        return user
+
+    except jwt.PyJWTError as e:
+        # Any JWT decode error results in authentication failure
+        print(f"JWT decode error: {str(e)}")
+        raise credentials_exception
+# Function to generate a reset code
+def generate_reset_code(length=6):
+    """Generate a random alphanumeric reset code"""
+    return ''.join(random.choices(string.ascii_uppercase + string.digits, k=length))
 
 # API endpoints
 @app.post("/register", response_model=ResponseModel)
@@ -355,7 +419,104 @@ async def login(login_data: LoginRequest):
         "data": token_data,
         "message": "Login successful"
     }
+@app.post("/password/reset-request", response_model=ResponseModel)
+async def request_password_reset(reset_request: PasswordResetRequest):
+    """
+    Request a password reset. Sends a reset code to the user.
+    """
+    # Check if user exists
+    user = get_user(reset_request.username)
+    if not user:
+        return JSONResponse(
+            status_code=status.HTTP_404_NOT_FOUND,
+            content={"success": False, "message": "User not found"}
+        )
+    
+    # Generate a reset code
+    reset_code = generate_reset_code()
+    
+    # Store the reset code with expiration time (30 minutes)
+    expiration_time = datetime.utcnow() + timedelta(minutes=30)
+    password_reset_codes[reset_request.username] = {
+        "code": reset_code,
+        "expires_at": expiration_time
+    }
+    
+    # In a real application, you would send this code via email
+    # For demonstration purposes, we're returning it in the response
+    return {
+        "success": True,
+        "data": {"reset_code": reset_code},  # In production, remove this and send via email
+        "message": "Password reset code generated. In a production environment, this would be sent to your email."
+    }
 
+@app.post("/password/reset-verify", response_model=ResponseModel)
+async def verify_reset_and_change_password(reset_verify: PasswordResetVerify):
+    """
+    Verify the reset code and update the user's password.
+    """
+    # Check if user exists
+    user = get_user(reset_verify.username)
+    if not user:
+        return JSONResponse(
+            status_code=status.HTTP_404_NOT_FOUND,
+            content={"success": False, "message": "User not found"}
+        )
+    
+    # Verify that a reset code exists for this user
+    if reset_verify.username not in password_reset_codes:
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content={"success": False, "message": "No reset code requested for this user or code has expired"}
+        )
+    
+    # Get the stored reset data
+    reset_data = password_reset_codes[reset_verify.username]
+    
+    # Check if the reset code has expired
+    if datetime.utcnow() > reset_data["expires_at"]:
+        # Remove expired code
+        del password_reset_codes[reset_verify.username]
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content={"success": False, "message": "Reset code has expired"}
+        )
+    
+    # Verify the reset code
+    if reset_data["code"] != reset_verify.reset_code:
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content={"success": False, "message": "Invalid reset code"}
+        )
+    
+    # Update the user's password
+    conn = sqlite3.connect(DATABASE_NAME)
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            "UPDATE users SET password = ? WHERE username = ?",
+            (reset_verify.new_password, reset_verify.username)
+        )
+        conn.commit()
+        
+        # Remove the reset code after successful password change
+        del password_reset_codes[reset_verify.username]
+        
+        # Invalidate all existing tokens for this user
+        # This is handled by the token expiration in the JWT
+        
+        return {
+            "success": True,
+            "message": "Password changed successfully"
+        }
+    except Exception as e:
+        conn.rollback()
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"success": False, "message": f"Database error: {str(e)}"}
+        )
+    finally:
+        conn.close()
 @app.get("/categories", response_model=CategoriesResponse)
 async def get_categories():
     # No authentication required for fetching categories
