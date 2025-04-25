@@ -732,88 +732,104 @@ async def archive_month_expenses(year: int, month: int, current_user: dict = Dep
         )
 
 # Excel export and archiving functions
+import sqlite3
+import pandas as pd
+import calendar
+from openpyxl.styles import PatternFill
+import os
+
+EXCEL_EXPORT_DIRECTORY = '/root/exports'  # Ensure this is correct
+
 def export_expenses_to_excel(year, month):
-    conn = sqlite3.connect(DATABASE_NAME)
-    conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
+    try:
+        conn = sqlite3.connect(DATABASE_NAME)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
 
-    # Format dates for query
-    start_date = f"{year}-{month:02d}-01"
-    _, last_day = calendar.monthrange(year, month)
-    end_date = f"{year}-{month:02d}-{last_day} 23:59:59"
+        # Format dates for query
+        start_date = f"{year}-{month:02d}-01"
+        _, last_day = calendar.monthrange(year, month)
+        end_date = f"{year}-{month:02d}-{last_day} 23:59:59"
 
-    # Get expenses for the month
-    cursor.execute(
-        """
-        SELECT e.id, e.invoice_id, e.amount, e.category, e.description, e.date_created,
-               u.username, u.role
-        FROM expenses e
-        JOIN users u ON e.user_id = u.id
-        WHERE e.date_created BETWEEN ? AND ?
-        """,
-        (start_date, end_date)
-    )
+        # Get expenses for the month
+        cursor.execute(
+            """
+            SELECT e.id, e.invoice_id, e.amount, e.category, e.description, e.date_created,
+                   u.username, u.role
+            FROM expenses e
+            JOIN users u ON e.user_id = u.id
+            WHERE e.date_created BETWEEN ? AND ?
+            """,
+            (start_date, end_date)
+        )
 
-    expenses = []
-    for row in cursor.fetchall():
-        expenses.append(dict(row))
+        expenses = []
+        for row in cursor.fetchall():
+            expenses.append(dict(row))
 
-    # Create DataFrame for Excel export
-    if expenses:
-        df = pd.DataFrame(expenses)
+        # Check if the directory exists and is writable
+        if not os.path.exists(EXCEL_EXPORT_DIRECTORY):
+            os.makedirs(EXCEL_EXPORT_DIRECTORY)
+            print(f"Directory {EXCEL_EXPORT_DIRECTORY} created.")
 
-        # Create Excel writer with formatting
-        filename = f"{EXCEL_EXPORT_DIRECTORY}/expenses_{year}_{month:02d}.xlsx"
-        writer = pd.ExcelWriter(filename, engine='openpyxl')
+        if expenses:
+            df = pd.DataFrame(expenses)
 
-        # Write data
-        df.to_excel(writer, index=False, sheet_name='Expenses')
+            # Create Excel writer with formatting
+            filename = f"{EXCEL_EXPORT_DIRECTORY}/expenses_{year}_{month:02d}.xlsx"
+            writer = pd.ExcelWriter(filename, engine='openpyxl')
 
-        # Get the workbook and worksheet objects
-        workbook = writer.book
-        worksheet = writer.sheets['Expenses']
+            # Write data
+            df.to_excel(writer, index=False, sheet_name='Expenses')
 
-        # Import openpyxl for Excel color formatting
-        import openpyxl
-        from openpyxl.styles import PatternFill
+            # Get the workbook and worksheet objects
+            workbook = writer.book
+            worksheet = writer.sheets['Expenses']
 
-        # Add color formatting based on user role
-        for idx, row in enumerate(df.itertuples(index=False), start=2):  # Start from row 2 (after header)
-            cell_color = "E6F2FF" if row.role == "guest" else "FFE6E6"  # Light blue for guest, light red for admin
-            for col in range(1, len(df.columns) + 1):
-                cell = worksheet.cell(row=idx, column=col)
-                cell.fill = PatternFill(start_color=cell_color, end_color=cell_color, fill_type="solid")
+            # Add color formatting based on user role
+            for idx, row in enumerate(df.itertuples(index=False), start=2):  # Start from row 2 (after header)
+                cell_color = "E6F2FF" if row.role == "guest" else "FFE6E6"  # Light blue for guest, light red for admin
+                for col in range(1, len(df.columns) + 1):
+                    cell = worksheet.cell(row=idx, column=col)
+                    cell.fill = PatternFill(start_color=cell_color, end_color=cell_color, fill_type="solid")
 
-        # Add total row
-        total_row = len(df) + 2
-        worksheet.cell(row=total_row, column=1, value="Total")
-        worksheet.cell(row=total_row, column=3, value=f"=SUM(C2:C{total_row-1})")
+            # Add total row
+            total_row = len(df) + 2
+            worksheet.cell(row=total_row, column=1, value="Total")
+            worksheet.cell(row=total_row, column=3, value=f"=SUM(C2:C{total_row-1})")
 
-        # Add some formatting
-        for col in worksheet.columns:
-            max_length = 0
-            column = col[0].column_letter
-            for cell in col:
-                try:
-                    if len(str(cell.value)) > max_length:
-                        max_length = len(cell.value)
-                except:
-                    pass
-            adjusted_width = (max_length + 2)
-            worksheet.column_dimensions[column].width = adjusted_width
+            # Add some formatting
+            for col in worksheet.columns:
+                max_length = 0
+                column = col[0].column_letter
+                for cell in col:
+                    try:
+                        if len(str(cell.value)) > max_length:
+                            max_length = len(cell.value)
+                    except:
+                        pass
+                adjusted_width = (max_length + 2)
+                worksheet.column_dimensions[column].width = adjusted_width
 
-        # Save the file
-        writer.close()
+            # Save the file
+            writer.close()
+            print(f"Excel file saved successfully: {filename}")
 
-        # Archive expenses
-        archive_expenses(year, month)
+            # Archive expenses
+            archive_expenses(year, month)
 
-        return filename
-    else:
-        # Create empty Excel file
-        filename = f"{EXCEL_EXPORT_DIRECTORY}/expenses_{year}_{month:02d}_empty.xlsx"
-        pd.DataFrame(columns=['No expenses found for this period']).to_excel(filename, index=False)
-        return filename
+            return filename
+        else:
+            # Create empty Excel file if no expenses found
+            filename = f"{EXCEL_EXPORT_DIRECTORY}/expenses_{year}_{month:02d}_empty.xlsx"
+            pd.DataFrame(columns=['No expenses found for this period']).to_excel(filename, index=False)
+            print(f"Empty Excel file created: {filename}")
+            return filename
+
+    except Exception as e:
+        print(f"Error during export: {e}")
+        return None
+
 
 def archive_expenses(year, month):
     conn = sqlite3.connect(DATABASE_NAME)
