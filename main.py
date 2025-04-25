@@ -1,6 +1,6 @@
 import random
 import string
-from fastapi import FastAPI, Depends, HTTPException, status, Header
+from fastapi import FastAPI, Depends, HTTPException, Response, status, Header
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any, Union
@@ -613,7 +613,7 @@ async def list_all_expenses(current_user: dict = Depends(get_current_admin)):
     finally:
         conn.close()
 
-@app.get("/export/current-month", response_model=ResponseModel)
+@app.get("/export/current-month")
 async def export_current_month_expenses(current_user: dict = Depends(get_current_user)):
     # Only admins can manually trigger export
     if current_user["role"] != UserRole.ADMIN:
@@ -624,13 +624,20 @@ async def export_current_month_expenses(current_user: dict = Depends(get_current
 
     try:
         current_date = datetime.now()
-        filename = export_expenses_to_excel(current_date.year, current_date.month)
-
-        return {
-            "success": True,
-            "data": {"filename": os.path.basename(filename)},
-            "message": "Report generated successfully"
-        }
+        excel_data, filename = export_expenses_to_excel_stream(current_date.year, current_date.month)
+        
+        if excel_data is None:
+            return JSONResponse(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                content={"success": False, "message": "Failed to generate Excel file"}
+            )
+        
+        # Return the file directly as a downloadable response
+        return Response(
+            content=excel_data,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f"attachment; filename={filename}"}
+        )
     except Exception as e:
         return JSONResponse(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -701,7 +708,7 @@ async def get_invoice_by_id(invoice_id: str, current_user: dict = Depends(get_cu
         conn.close()
 
 # API endpoint for manual archive operation
-@app.post("/archive/{year}/{month}", response_model=ResponseModel)
+@app.post("/archive/{year}/{month}")
 async def archive_month_expenses(year: int, month: int, current_user: dict = Depends(get_current_admin)):
     try:
         # Validate month and year
@@ -717,31 +724,37 @@ async def archive_month_expenses(year: int, month: int, current_user: dict = Dep
                 content={"success": False, "message": f"Invalid year. Must be between 2000-{datetime.now().year}"}
             )
 
-        # Export to Excel first (also performs archiving)
-        filename = export_expenses_to_excel(year, month)
-
-        return {
-            "success": True,
-            "data": {"filename": os.path.basename(filename)},
-            "message": f"Expenses for {year}-{month:02d} exported and archived successfully"
-        }
+        # Generate Excel file in memory and perform archiving
+        excel_data, filename = export_expenses_to_excel_stream(year, month)
+        
+        if excel_data is None:
+            return JSONResponse(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                content={"success": False, "message": "Failed to generate Excel file"}
+            )
+        
+        # Return the file directly
+        return Response(
+            content=excel_data,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f"attachment; filename={filename}"}
+        )
     except Exception as e:
         return JSONResponse(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             content={"success": False, "message": f"Archive operation failed: {str(e)}"}
         )
-
 # Excel export and archiving functions
 import sqlite3
 import pandas as pd
 import calendar
 from openpyxl.styles import PatternFill
-import os
+from io import BytesIO  # Add this instead
 
-EXCEL_EXPORT_DIRECTORY = '/root/accounting/exports'
-
-
-def export_expenses_to_excel(year, month):
+def export_expenses_to_excel_stream(year, month):
+    """
+    Generate an Excel file in memory and return it as bytes, without saving to disk
+    """
     try:
         conn = sqlite3.connect(DATABASE_NAME)
         conn.row_factory = sqlite3.Row
@@ -768,37 +781,35 @@ def export_expenses_to_excel(year, month):
         for row in cursor.fetchall():
             expenses.append(dict(row))
 
-        # Check if the directory exists and is writable
-        if not os.path.exists(EXCEL_EXPORT_DIRECTORY):
-            os.makedirs(EXCEL_EXPORT_DIRECTORY)
-            print(f"Directory {EXCEL_EXPORT_DIRECTORY} created.")
-
+        # Create in-memory file
+        from io import BytesIO
+        excel_binary = BytesIO()
+        
         if expenses:
             df = pd.DataFrame(expenses)
-
+            
             # Create Excel writer with formatting
-            filename = f"{EXCEL_EXPORT_DIRECTORY}/expenses_{year}_{month:02d}.xlsx"
-            writer = pd.ExcelWriter(filename, engine='openpyxl')
-
+            writer = pd.ExcelWriter(excel_binary, engine='openpyxl')
+            
             # Write data
             df.to_excel(writer, index=False, sheet_name='Expenses')
-
+            
             # Get the workbook and worksheet objects
             workbook = writer.book
             worksheet = writer.sheets['Expenses']
-
+            
             # Add color formatting based on user role
             for idx, row in enumerate(df.itertuples(index=False), start=2):  # Start from row 2 (after header)
                 cell_color = "E6F2FF" if row.role == "guest" else "FFE6E6"  # Light blue for guest, light red for admin
                 for col in range(1, len(df.columns) + 1):
                     cell = worksheet.cell(row=idx, column=col)
                     cell.fill = PatternFill(start_color=cell_color, end_color=cell_color, fill_type="solid")
-
+            
             # Add total row
             total_row = len(df) + 2
             worksheet.cell(row=total_row, column=1, value="Total")
             worksheet.cell(row=total_row, column=3, value=f"=SUM(C2:C{total_row-1})")
-
+            
             # Add some formatting
             for col in worksheet.columns:
                 max_length = 0
@@ -811,25 +822,25 @@ def export_expenses_to_excel(year, month):
                         pass
                 adjusted_width = (max_length + 2)
                 worksheet.column_dimensions[column].width = adjusted_width
-
-            # Save the file
+            
+            # Save to the in-memory file
             writer.close()
-            print(f"Excel file saved successfully: {filename}")
-
-            # Archive expenses
-            archive_expenses(year, month)
-
-            return filename
         else:
             # Create empty Excel file if no expenses found
-            filename = f"{EXCEL_EXPORT_DIRECTORY}/expenses_{year}_{month:02d}_empty.xlsx"
-            pd.DataFrame(columns=['No expenses found for this period']).to_excel(filename, index=False)
-            print(f"Empty Excel file created: {filename}")
-            return filename
+            empty_df = pd.DataFrame(columns=['No expenses found for this period'])
+            empty_df.to_excel(excel_binary, index=False)
 
+        # Get the binary content
+        excel_binary.seek(0)
+        
+        # Archive expenses (you may still want to do this even without saving the file)
+        archive_expenses(year, month)
+        
+        return excel_binary.getvalue(), f"expenses_{year}_{month:02d}.xlsx"
+        
     except Exception as e:
         print(f"Error during export: {e}")
-        return None
+        return None, None
 
 
 def archive_expenses(year, month):
