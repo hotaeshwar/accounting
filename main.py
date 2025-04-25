@@ -30,7 +30,7 @@ app = FastAPI(title="Office Expense Tracker API",
 # Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://api.accountsonline.info/", "http://localhost:5173"],  # React Vite's default port
+     allow_origins=["https://accountsonline.info", "https://www.accountsonline.info", "http://localhost:5173"],
     allow_credentials=True,
     allow_methods=["*"],  # Allow all methods (GET, POST, PUT, DELETE, etc.)
     allow_headers=["*"],  # Allow all headers
