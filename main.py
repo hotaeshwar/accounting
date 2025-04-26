@@ -233,6 +233,14 @@ def get_user(username: str):
         return {"id": user_data[0], "username": user_data[1], "password": user_data[2], "role": user_data[3]}
     return None
 
+def admin_exists():
+    conn = sqlite3.connect(DATABASE_NAME)
+    cursor = conn.cursor()
+    cursor.execute("SELECT COUNT(*) FROM users WHERE role = ?", (UserRole.ADMIN,))
+    count = cursor.fetchone()[0]
+    conn.close()
+    return count > 0
+
 def authenticate_user(username: str, password: str, role: Optional[UserRole] = None):
     user = get_user(username)
     if not user or user["password"] != password:
@@ -473,6 +481,13 @@ async def register(user: UserCreate):
         return JSONResponse(
             status_code=status.HTTP_400_BAD_REQUEST,
             content={"success": False, "message": "Username already registered"}
+        )
+
+    # Check if trying to register admin when one already exists
+    if user.role == UserRole.ADMIN and admin_exists():
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content={"success": False, "message": "Admin user already exists. Only one admin is allowed."}
         )
 
     conn = sqlite3.connect(DATABASE_NAME)
