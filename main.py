@@ -132,6 +132,17 @@ def init_db():
     )
     ''')
 
+    # Archived income table
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS archived_income (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        description TEXT,
+        amount REAL NOT NULL,
+        date_created TEXT NOT NULL,
+        archive_date TEXT NOT NULL
+    )
+    ''')
+
     conn.commit()
     conn.close()
 
@@ -304,7 +315,7 @@ def generate_reset_code(length=6):
 
 def export_expenses_to_excel_stream(year, month):
     """
-    Generate an Excel file with expenses and income data
+    Generate an Excel file with expenses and income data and archive both
     """
     try:
         conn = sqlite3.connect(DATABASE_NAME)
@@ -406,8 +417,8 @@ def export_expenses_to_excel_stream(year, month):
         writer.close()
         excel_binary.seek(0)
         
-        # Archive expenses after export
-        archive_expenses(year, month)
+        # Archive both expenses and income after export
+        archive_financial_data(year, month)
         
         return excel_binary.getvalue(), f"financial_report_{year}_{month:02d}.xlsx"
         
@@ -415,7 +426,8 @@ def export_expenses_to_excel_stream(year, month):
         print(f"Export error: {str(e)}")
         return None, None
 
-def archive_expenses(year, month):
+def archive_financial_data(year, month):
+    """Archive both expenses and income for the given month/year"""
     conn = sqlite3.connect(DATABASE_NAME)
     cursor = conn.cursor()
 
@@ -424,6 +436,7 @@ def archive_expenses(year, month):
     end_date = f"{year}-{month:02d}-{last_day} 23:59:59"
     archive_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+    # Archive expenses
     cursor.execute('''
         INSERT INTO archived_expenses
         (invoice_id, user_id, amount, category, description, date_created, archive_date)
@@ -434,6 +447,19 @@ def archive_expenses(year, month):
 
     cursor.execute('''
         DELETE FROM expenses WHERE date_created BETWEEN ? AND ?
+    ''', (start_date, end_date))
+
+    # Archive income
+    cursor.execute('''
+        INSERT INTO archived_income
+        (description, amount, date_created, archive_date)
+        SELECT description, amount, date_created, ?
+        FROM income
+        WHERE date_created BETWEEN ? AND ?
+    ''', (archive_date, start_date, end_date))
+
+    cursor.execute('''
+        DELETE FROM income WHERE date_created BETWEEN ? AND ?
     ''', (start_date, end_date))
 
     conn.commit()
