@@ -1,6 +1,6 @@
 import random
 import string
-from fastapi import FastAPI, Depends, HTTPException, Response, status, Header
+from fastapi import FastAPI, Depends, HTTPException, Response, status, Header, Request
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any, Union
@@ -22,6 +22,7 @@ SECRET_KEY = "09d25e094faa6ca2556c818166b7a9563b93f7099f6f0f4caa6cf63b88e8d3e7"
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
 EXCEL_EXPORT_DIRECTORY = "exports"
+ADMIN_SECRET_KEY = "734bb15a7c471de7b40bebe1b0dad8fefc05654984f36411d7b79ebbe7e9df77"  # Change this in production
 
 # Create exports directory if it doesn't exist
 if not os.path.exists(EXCEL_EXPORT_DIRECTORY):
@@ -63,26 +64,10 @@ class UserRole(str, Enum):
     ADMIN = "admin"
     GUEST = "guest"
 
-# Database setup
+# Database setup with trigger
 def init_db():
     conn = sqlite3.connect(DATABASE_NAME)
     cursor = conn.cursor()
-
-    # Check if users table exists and has password column
-    has_password_column = False
-    try:
-        cursor.execute("PRAGMA table_info(users)")
-        columns = [info[1] for info in cursor.fetchall()]
-        has_password_column = 'password' in columns
-    except sqlite3.OperationalError:
-        pass
-
-    if os.path.exists(DATABASE_NAME) and not has_password_column:
-        conn.close()
-        os.remove(DATABASE_NAME)
-        conn = sqlite3.connect(DATABASE_NAME)
-        cursor = conn.cursor()
-        print("Recreating database with correct schema")
 
     # Users table
     cursor.execute('''
@@ -92,6 +77,17 @@ def init_db():
         password TEXT NOT NULL,
         role TEXT NOT NULL
     )
+    ''')
+
+    # Add admin restriction trigger
+    cursor.execute('''
+    CREATE TRIGGER IF NOT EXISTS prevent_multi_admin
+    BEFORE INSERT ON users
+    FOR EACH ROW
+    WHEN NEW.role = 'admin' AND EXISTS (SELECT 1 FROM users WHERE role = 'admin')
+    BEGIN
+        SELECT RAISE(ABORT, 'Only one admin allowed');
+    END;
     ''')
 
     # Expenses table
@@ -154,6 +150,7 @@ class UserCreate(BaseModel):
     username: str
     password: str
     role: UserRole
+    admin_key: Optional[str] = None  # For admin registration only
 
 class User(BaseModel):
     id: int
@@ -201,6 +198,7 @@ class ResponseModel(BaseModel):
     success: bool
     data: Optional[Any] = None
     message: Optional[str] = None
+    admin_exists: Optional[bool] = None  # Added for frontend control
 
 class CategoryItem(BaseModel):
     key: str
@@ -263,7 +261,7 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
 
 async def get_current_user(
     authorization: Optional[str] = Header(None),
-    x: Optional[str] = None,
+    x_auth_token: Optional[str] = Header(None)
 ):
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
@@ -274,11 +272,11 @@ async def get_current_user(
     token = None
     if authorization and authorization.startswith("Bearer "):
         token = authorization.split("Bearer ")[1]
-    elif x:
-        if x.startswith("Bearer "):
-            token = x.split("Bearer ")[1]
+    elif x_auth_token:
+        if x_auth_token.startswith("Bearer "):
+            token = x_auth_token.split("Bearer ")[1]
         else:
-            token = x
+            token = x_auth_token
 
     if not token:
         raise credentials_exception
@@ -476,30 +474,75 @@ def archive_financial_data(year, month):
 # API endpoints
 @app.post("/register", response_model=ResponseModel)
 async def register(user: UserCreate):
-    db_user = get_user(user.username)
-    if db_user:
-        return JSONResponse(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            content={"success": False, "message": "Username already registered"}
-        )
-
-    # Check if trying to register admin when one already exists
-    if user.role == UserRole.ADMIN and admin_exists():
-        return JSONResponse(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            content={"success": False, "message": "Admin user already exists. Only one admin is allowed."}
-        )
-
     conn = sqlite3.connect(DATABASE_NAME)
     cursor = conn.cursor()
+    
     try:
+        # Check if username exists
+        cursor.execute("SELECT id FROM users WHERE username = ?", (user.username,))
+        if cursor.fetchone():
+            conn.close()
+            return JSONResponse(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                content={"success": False, "message": "Username already registered"}
+            )
+
+        # Admin registration logic
+        if user.role == UserRole.ADMIN:
+            # Check if admin exists (atomic operation)
+            cursor.execute("BEGIN IMMEDIATE")
+            cursor.execute("SELECT COUNT(*) FROM users WHERE role = ?", (UserRole.ADMIN,))
+            admin_count = cursor.fetchone()[0]
+            
+            if admin_count > 0:
+                conn.rollback()
+                conn.close()
+                return JSONResponse(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    content={
+                        "success": False,
+                        "message": "Admin registration is disabled",
+                        "admin_exists": True
+                    }
+                )
+
+            # Verify admin key
+            if user.admin_key != ADMIN_SECRET_KEY:
+                conn.rollback()
+                conn.close()
+                return JSONResponse(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    content={"success": False, "message": "Invalid admin registration key"}
+                )
+
+        # Insert the new user
         cursor.execute("INSERT INTO users (username, password, role) VALUES (?, ?, ?)",
-                    (user.username, user.password, user.role))
+                      (user.username, user.password, user.role))
         user_id = cursor.lastrowid
         conn.commit()
 
         user_data = {"id": user_id, "username": user.username, "role": user.role}
-        return {"success": True, "data": user_data, "message": "User registered successfully"}
+        return {
+            "success": True,
+            "data": user_data,
+            "message": "User registered successfully",
+            "admin_exists": user.role == UserRole.ADMIN
+        }
+    except sqlite3.IntegrityError as e:
+        if "Only one admin allowed" in str(e):
+            return JSONResponse(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                content={
+                    "success": False,
+                    "message": "Admin user already exists. Only one admin is allowed.",
+                    "admin_exists": True
+                }
+            )
+        conn.rollback()
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"success": False, "message": f"Database error: {str(e)}"}
+        )
     except Exception as e:
         conn.rollback()
         return JSONResponse(
@@ -921,9 +964,7 @@ async def create_income(income: IncomeCreate, current_user: dict = Depends(get_c
             content={"success": False, "message": f"Database error: {str(e)}"}
         )
     finally:
-        conn.close()
-
-@app.get("/profit-loss/current-month", response_model=ResponseModel)
+        conn.close()@app.get("/profit-loss/current-month", response_model=ResponseModel)
 async def get_current_month_profit_loss(current_user: dict = Depends(get_current_user)):
     now = datetime.now()
     start_date = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0).strftime("%Y-%m-%d %H:%M:%S")
