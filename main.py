@@ -365,7 +365,7 @@ def export_expenses_to_excel_stream(year, month):
             df_expenses.to_excel(writer, index=False, sheet_name='Expenses')
             ws_exp = writer.sheets['Expenses']
             
-            # Formatting
+            # Formatting - different colors for admin/guest entries
             for idx, row in enumerate(df_expenses.itertuples(index=False), start=2):
                 cell_color = "E6F2FF" if row.role == "guest" else "FFE6E6"
                 for col in range(1, len(df_expenses.columns) + 1):
@@ -424,8 +424,10 @@ def export_expenses_to_excel_stream(year, month):
         writer.close()
         excel_binary.seek(0)
         
-        # Archive both expenses and income after export
-        archive_financial_data(year, month)
+        # Only archive data older than 1 month
+        one_month_ago = datetime.now() - timedelta(days=30)
+        if datetime(year, month, 1) < one_month_ago:
+            archive_financial_data(year, month)
         
         return excel_binary.getvalue(), f"financial_report_{year}_{month:02d}.xlsx"
         
@@ -739,11 +741,14 @@ async def list_all_expenses(current_user: dict = Depends(get_current_admin)):
 
     try:
         cursor.execute(
-            "SELECT e.id, e.invoice_id, e.user_id, e.amount, e.category, e.description, e.date_created, u.username FROM expenses e JOIN users u ON e.user_id = u.id"
+            "SELECT e.id, e.invoice_id, e.user_id, e.amount, e.category, e.description, e.date_created, u.username, u.role FROM expenses e JOIN users u ON e.user_id = u.id"
         )
         expenses = []
         for row in cursor.fetchall():
-            expenses.append(dict(row))
+            expense = dict(row)
+            # Add role information for frontend to differentiate
+            expense["is_guest"] = expense["role"] == "guest"
+            expenses.append(expense)
 
         return {"success": True, "data": expenses}
     except Exception as e:
