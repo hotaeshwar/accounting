@@ -23,6 +23,7 @@ ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
 EXCEL_EXPORT_DIRECTORY = "exports"
 ADMIN_SECRET_KEY = "734bb15a7c471de7b40bebe1b0dad8fefc05654984f36411d7b79ebbe7e9df77"  # Change this in production
+ARCHIVE_RETENTION_DAYS = 30  # Keep archives for 30 days
 
 # Create exports directory if it doesn't exist
 if not os.path.exists(EXCEL_EXPORT_DIRECTORY):
@@ -105,7 +106,7 @@ def init_db():
     )
     ''')
 
-    # Archived expenses table
+    # Archived expenses table - Adding archive_expiry field
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS archived_expenses (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -115,7 +116,8 @@ def init_db():
         category TEXT NOT NULL,
         description TEXT,
         date_created TEXT NOT NULL,
-        archive_date TEXT NOT NULL
+        archive_date TEXT NOT NULL,
+        archive_expiry TEXT NOT NULL
     )
     ''')
 
@@ -129,14 +131,15 @@ def init_db():
     )
     ''')
 
-    # Archived income table
+    # Archived income table - Adding archive_expiry field
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS archived_income (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         description TEXT,
         amount REAL NOT NULL,
         date_created TEXT NOT NULL,
-        archive_date TEXT NOT NULL
+        archive_date TEXT NOT NULL,
+        archive_expiry TEXT NOT NULL
     )
     ''')
 
@@ -320,11 +323,35 @@ password_reset_codes = {}
 def generate_reset_code(length=6):
     return ''.join(random.choices(string.ascii_uppercase + string.digits, k=length))
 
+def purge_expired_archives():
+    """Purge archives that have exceeded their retention period"""
+    conn = sqlite3.connect(DATABASE_NAME)
+    cursor = conn.cursor()
+    current_datetime = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    # Delete expired archived expenses
+    cursor.execute(
+        "DELETE FROM archived_expenses WHERE archive_expiry < ?", 
+        (current_datetime,)
+    )
+    
+    # Delete expired archived income
+    cursor.execute(
+        "DELETE FROM archived_income WHERE archive_expiry < ?", 
+        (current_datetime,)
+    )
+    
+    conn.commit()
+    conn.close()
+
 def export_expenses_to_excel_stream(year, month):
     """
     Generate an Excel file with expenses and income data and archive both
     """
     try:
+        # First purge any expired archives
+        purge_expired_archives()
+        
         conn = sqlite3.connect(DATABASE_NAME)
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
@@ -334,7 +361,7 @@ def export_expenses_to_excel_stream(year, month):
         _, last_day = calendar.monthrange(year, month)
         end_date = f"{year}-{month:02d}-{last_day} 23:59:59"
 
-        # Get expenses data
+        # Get expenses data - including user role information
         cursor.execute('''
             SELECT e.id, e.invoice_id, e.amount, e.category, e.description, e.date_created,
                    u.username, u.role
@@ -354,6 +381,10 @@ def export_expenses_to_excel_stream(year, month):
         ''', (start_date, end_date))
         income = [dict(row) for row in cursor.fetchall()]
 
+        # Create timestamp for unique filename
+        timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+        filename = f"financial_report_{year}_{month:02d}_{timestamp}.xlsx"
+        
         # Create Excel file in memory
         excel_binary = BytesIO()
         writer = pd.ExcelWriter(excel_binary, engine='openpyxl')
@@ -365,9 +396,9 @@ def export_expenses_to_excel_stream(year, month):
             df_expenses.to_excel(writer, index=False, sheet_name='Expenses')
             ws_exp = writer.sheets['Expenses']
             
-            # Formatting - different colors for admin/guest entries
+            # Formatting - Highlight guest entries with blue background, admin with red
             for idx, row in enumerate(df_expenses.itertuples(index=False), start=2):
-                cell_color = "E6F2FF" if row.role == "guest" else "FFE6E6"
+                cell_color = "E6F2FF" if row.role == "guest" else "FFE6E6"  # Blue for guest, Red for admin
                 for col in range(1, len(df_expenses.columns) + 1):
                     ws_exp.cell(row=idx, column=col).fill = PatternFill(
                         start_color=cell_color, end_color=cell_color, fill_type="solid"
@@ -424,12 +455,10 @@ def export_expenses_to_excel_stream(year, month):
         writer.close()
         excel_binary.seek(0)
         
-        # Only archive data older than 1 month
-        one_month_ago = datetime.now() - timedelta(days=30)
-        if datetime(year, month, 1) < one_month_ago:
-            archive_financial_data(year, month)
+        # Archive both expenses and income after export
+        archive_financial_data(year, month)
         
-        return excel_binary.getvalue(), f"financial_report_{year}_{month:02d}.xlsx"
+        return excel_binary.getvalue(), filename
         
     except Exception as e:
         print(f"Export error: {str(e)}")
@@ -443,16 +472,19 @@ def archive_financial_data(year, month):
     start_date = f"{year}-{month:02d}-01"
     _, last_day = calendar.monthrange(year, month)
     end_date = f"{year}-{month:02d}-{last_day} 23:59:59"
+    
     archive_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    # Set expiry date to 30 days from now
+    archive_expiry = (datetime.now() + timedelta(days=ARCHIVE_RETENTION_DAYS)).strftime("%Y-%m-%d %H:%M:%S")
 
     # Archive expenses
     cursor.execute('''
         INSERT INTO archived_expenses
-        (invoice_id, user_id, amount, category, description, date_created, archive_date)
-        SELECT invoice_id, user_id, amount, category, description, date_created, ?
+        (invoice_id, user_id, amount, category, description, date_created, archive_date, archive_expiry)
+        SELECT invoice_id, user_id, amount, category, description, date_created, ?, ?
         FROM expenses
         WHERE date_created BETWEEN ? AND ?
-    ''', (archive_date, start_date, end_date))
+    ''', (archive_date, archive_expiry, start_date, end_date))
 
     cursor.execute('''
         DELETE FROM expenses WHERE date_created BETWEEN ? AND ?
@@ -461,11 +493,11 @@ def archive_financial_data(year, month):
     # Archive income
     cursor.execute('''
         INSERT INTO archived_income
-        (description, amount, date_created, archive_date)
-        SELECT description, amount, date_created, ?
+        (description, amount, date_created, archive_date, archive_expiry)
+        SELECT description, amount, date_created, ?, ?
         FROM income
         WHERE date_created BETWEEN ? AND ?
-    ''', (archive_date, start_date, end_date))
+    ''', (archive_date, archive_expiry, start_date, end_date))
 
     cursor.execute('''
         DELETE FROM income WHERE date_created BETWEEN ? AND ?
@@ -740,15 +772,18 @@ async def list_all_expenses(current_user: dict = Depends(get_current_admin)):
     cursor = conn.cursor()
 
     try:
+        # Fetch expenses with user role information for color coding
         cursor.execute(
-            "SELECT e.id, e.invoice_id, e.user_id, e.amount, e.category, e.description, e.date_created, u.username, u.role FROM expenses e JOIN users u ON e.user_id = u.id"
+            """
+            SELECT e.id, e.invoice_id, e.user_id, e.amount, e.category, e.description, 
+                   e.date_created, u.username, u.role 
+            FROM expenses e 
+            JOIN users u ON e.user_id = u.id
+            """
         )
         expenses = []
         for row in cursor.fetchall():
-            expense = dict(row)
-            # Add role information for frontend to differentiate
-            expense["is_guest"] = expense["role"] == "guest"
-            expenses.append(expense)
+            expenses.append(dict(row))
 
         return {"success": True, "data": expenses}
     except Exception as e:
@@ -768,6 +803,9 @@ async def export_current_month_expenses(current_user: dict = Depends(get_current
         )
 
     try:
+        # Check for expired archives and purge them
+        purge_expired_archives()
+        
         current_date = datetime.now()
         excel_data, filename = export_expenses_to_excel_stream(current_date.year, current_date.month)
         
@@ -802,7 +840,6 @@ async def download_report(filename: str, current_user: dict = Depends(get_curren
         filename=filename,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
-
 @app.get("/invoice/{invoice_id}", response_model=ResponseModel)
 async def get_invoice_by_id(invoice_id: str, current_user: dict = Depends(get_current_user)):
     conn = sqlite3.connect(DATABASE_NAME)
