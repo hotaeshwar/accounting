@@ -39,6 +39,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],  # Adding this to expose headers that might be needed
 )
 
 # Define expense categories
@@ -964,7 +965,8 @@ async def create_income(income: IncomeCreate, current_user: dict = Depends(get_c
             content={"success": False, "message": f"Database error: {str(e)}"}
         )
     finally:
-        conn.close()@app.get("/profit-loss/current-month", response_model=ResponseModel)
+        conn.close()
+@app.get("/profit-loss/current-month", response_model=ResponseModel)
 async def get_current_month_profit_loss(current_user: dict = Depends(get_current_user)):
     now = datetime.now()
     start_date = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0).strftime("%Y-%m-%d %H:%M:%S")
@@ -997,12 +999,12 @@ async def get_current_month_profit_loss(current_user: dict = Depends(get_current
 
         net_profit_loss = total_income - total_expenses
 
-        profit_loss_data = ProfitLossData(
-            total_income=total_income,
-            total_expenses=total_expenses,
-            net_profit_loss=net_profit_loss,
-            expenses_by_category=expenses_by_category
-        )
+        profit_loss_data = {
+            "total_income": total_income,
+            "total_expenses": total_expenses,
+            "net_profit_loss": net_profit_loss,
+            "expenses_by_category": expenses_by_category
+        }
 
         return {
             "success": True,
@@ -1016,7 +1018,6 @@ async def get_current_month_profit_loss(current_user: dict = Depends(get_current
         )
     finally:
         conn.close()
-
 # Health check endpoint
 @app.get("/health")
 async def health_check():
