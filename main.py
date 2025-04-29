@@ -23,8 +23,7 @@ ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
 EXCEL_EXPORT_DIRECTORY = "exports"
 ADMIN_SECRET_KEY = "734bb15a7c471de7b40bebe1b0dad8fefc05654984f36411d7b79ebbe7e9df77"  # Change this in production
-ARCHIVE_RETENTION_DAYS = 30  # Keep archives for 30 days
-
+ARCHIVE_RETENTION_DAYS = 30
 # Create exports directory if it doesn't exist
 if not os.path.exists(EXCEL_EXPORT_DIRECTORY):
     os.makedirs(EXCEL_EXPORT_DIRECTORY)
@@ -40,7 +39,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["*"],  # Adding this to expose headers that might be needed
+    expose_headers=["*"],
 )
 
 # Define expense categories
@@ -106,21 +105,6 @@ def init_db():
     )
     ''')
 
-    # Archived expenses table - Adding archive_expiry field
-    cursor.execute('''
-    CREATE TABLE IF NOT EXISTS archived_expenses (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        invoice_id TEXT UNIQUE NOT NULL,
-        user_id INTEGER NOT NULL,
-        amount REAL NOT NULL,
-        category TEXT NOT NULL,
-        description TEXT,
-        date_created TEXT NOT NULL,
-        archive_date TEXT NOT NULL,
-        archive_expiry TEXT NOT NULL
-    )
-    ''')
-
     # Income table
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS income (
@@ -131,24 +115,11 @@ def init_db():
     )
     ''')
 
-    # Archived income table - Adding archive_expiry field
-    cursor.execute('''
-    CREATE TABLE IF NOT EXISTS archived_income (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        description TEXT,
-        amount REAL NOT NULL,
-        date_created TEXT NOT NULL,
-        archive_date TEXT NOT NULL,
-        archive_expiry TEXT NOT NULL
-    )
-    ''')
-
     conn.commit()
     conn.close()
 
 # Initialize database
 init_db()
-
 # Pydantic models
 class UserCreate(BaseModel):
     username: str
@@ -346,12 +317,9 @@ def purge_expired_archives():
 
 def export_expenses_to_excel_stream(year, month):
     """
-    Generate an Excel file with expenses and income data and archive both
+    Generate an Excel file with expenses and income data without archiving
     """
     try:
-        # First purge any expired archives
-        purge_expired_archives()
-        
         conn = sqlite3.connect(DATABASE_NAME)
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
@@ -455,15 +423,13 @@ def export_expenses_to_excel_stream(year, month):
         writer.close()
         excel_binary.seek(0)
         
-        # Archive both expenses and income after export
-        archive_financial_data(year, month)
-        
         return excel_binary.getvalue(), filename
         
     except Exception as e:
         print(f"Export error: {str(e)}")
         return None, None
-
+    finally:
+        conn.close()
 def archive_financial_data(year, month):
     """Archive both expenses and income for the given month/year"""
     conn = sqlite3.connect(DATABASE_NAME)
@@ -803,9 +769,6 @@ async def export_current_month_expenses(current_user: dict = Depends(get_current
         )
 
     try:
-        # Check for expired archives and purge them
-        purge_expired_archives()
-        
         current_date = datetime.now()
         excel_data, filename = export_expenses_to_excel_stream(current_date.year, current_date.month)
         
