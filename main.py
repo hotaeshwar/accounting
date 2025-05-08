@@ -318,6 +318,8 @@ def purge_expired_archives():
 def export_expenses_to_excel_stream(year, month):
     """
     Generate an Excel file with expenses and income data with totals
+    Returns:
+        tuple: (excel_binary, filename, total_expenses, total_income, net_amount)
     """
     try:
         conn = sqlite3.connect(DATABASE_NAME)
@@ -348,6 +350,11 @@ def export_expenses_to_excel_stream(year, month):
             ORDER BY date_created
         ''', (start_date, end_date))
         income = [dict(row) for row in cursor.fetchall()]
+
+        # Calculate totals
+        total_expenses = sum(exp['amount'] for exp in expenses) if expenses else 0
+        total_income = sum(inc['amount'] for inc in income) if income else 0
+        net_amount = total_income - total_expenses
 
         # Create timestamp for unique filename
         timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
@@ -400,10 +407,6 @@ def export_expenses_to_excel_stream(year, month):
 
         # Add summary sheet with more detailed breakdown
         if expenses or income:
-            total_exp = sum(exp['amount'] for exp in expenses) if expenses else 0
-            total_inc = sum(inc['amount'] for inc in income) if income else 0
-            net = total_inc - total_exp
-            
             # Create category breakdown
             categories = {}
             for exp in expenses:
@@ -415,7 +418,7 @@ def export_expenses_to_excel_stream(year, month):
             # Summary data with categories
             summary_data = {
                 'Metric': ['Total Income', 'Total Expenses', 'Net Profit/Loss'] + list(categories.keys()),
-                'Amount': [total_inc, total_exp, net] + list(categories.values())
+                'Amount': [total_income, total_expenses, net_amount] + list(categories.values())
             }
             
             df_summary = pd.DataFrame(summary_data)
@@ -424,8 +427,8 @@ def export_expenses_to_excel_stream(year, month):
             
             # Format net profit/loss
             ws_sum.cell(row=4, column=2).fill = PatternFill(
-                start_color="98FB98" if net >= 0 else "FF6347",
-                end_color="98FB98" if net >= 0 else "FF6347",
+                start_color="98FB98" if net_amount >= 0 else "FF6347",
+                end_color="98FB98" if net_amount >= 0 else "FF6347",
                 fill_type="solid"
             )
             
@@ -447,11 +450,11 @@ def export_expenses_to_excel_stream(year, month):
         writer.close()
         excel_binary.seek(0)
         
-        return excel_binary.getvalue(), filename
+        return excel_binary.getvalue(), filename, total_expenses, total_income, net_amount
         
     except Exception as e:
         print(f"Export error: {str(e)}")
-        return None, None
+        return None, None, 0, 0, 0
     finally:
         conn.close()
 def archive_financial_data(year, month):
