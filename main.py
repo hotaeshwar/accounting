@@ -797,7 +797,8 @@ async def export_current_month_expenses(current_user: dict = Depends(get_current
 
     try:
         current_date = datetime.now()
-        excel_data, filename = export_expenses_to_excel_stream(current_date.year, current_date.month)
+        # Fix: Unpack all 5 values or use _ for ones you don't need
+        excel_data, filename, _, _, _ = export_expenses_to_excel_stream(current_date.year, current_date.month)
         
         if excel_data is None:
             return JSONResponse(
@@ -815,21 +816,6 @@ async def export_current_month_expenses(current_user: dict = Depends(get_current
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             content={"success": False, "message": f"Export error: {str(e)}"}
         )
-
-@app.get("/download/report/{filename}")
-async def download_report(filename: str, current_user: dict = Depends(get_current_admin)):
-    filepath = os.path.join(EXCEL_EXPORT_DIRECTORY, filename)
-    if not os.path.exists(filepath):
-        return JSONResponse(
-            status_code=status.HTTP_404_NOT_FOUND,
-            content={"success": False, "message": "Report file not found"}
-        )
-
-    return FileResponse(
-        path=filepath,
-        filename=filename,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    )
 @app.get("/invoice/{invoice_id}", response_model=ResponseModel)
 async def get_invoice_by_id(invoice_id: str, current_user: dict = Depends(get_current_user)):
     conn = sqlite3.connect(DATABASE_NAME)
