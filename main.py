@@ -317,7 +317,7 @@ def purge_expired_archives():
 
 def export_expenses_to_excel_stream(year, month):
     """
-    Generate an Excel file with expenses and income data without archiving
+    Generate an Excel file with expenses and income data with totals
     """
     try:
         conn = sqlite3.connect(DATABASE_NAME)
@@ -358,7 +358,7 @@ def export_expenses_to_excel_stream(year, month):
         writer = pd.ExcelWriter(excel_binary, engine='openpyxl')
         workbook = writer.book
 
-        # Add expenses sheet
+        # Add expenses sheet with total
         if expenses:
             df_expenses = pd.DataFrame(expenses)
             df_expenses.to_excel(writer, index=False, sheet_name='Expenses')
@@ -372,53 +372,77 @@ def export_expenses_to_excel_stream(year, month):
                         start_color=cell_color, end_color=cell_color, fill_type="solid"
                     )
             
-            # Add totals
+            # Add totals row at the bottom
             total_row = len(df_expenses) + 3
             ws_exp.cell(row=total_row, column=1, value="Total Expenses").font = Font(bold=True)
             ws_exp.cell(row=total_row, column=3, value=f"=SUM(C2:C{total_row-1})").font = Font(bold=True)
+            
+            # Apply bold to total and formatting
+            ws_exp.cell(row=total_row, column=3).fill = PatternFill(
+                start_color="FFD700", end_color="FFD700", fill_type="solid"
+            )
 
-        # Add income sheet
+        # Add income sheet with total
         if income:
             df_income = pd.DataFrame(income)
             df_income.to_excel(writer, index=False, sheet_name='Income')
             ws_inc = writer.sheets['Income']
             
-            # Add totals
+            # Add totals row at the bottom
             total_row = len(df_income) + 3
             ws_inc.cell(row=total_row, column=1, value="Total Income").font = Font(bold=True)
             ws_inc.cell(row=total_row, column=3, value=f"=SUM(C2:C{total_row-1})").font = Font(bold=True)
+            
+            # Apply bold to total and formatting
+            ws_inc.cell(row=total_row, column=3).fill = PatternFill(
+                start_color="98FB98", end_color="98FB98", fill_type="solid"
+            )
 
-        # Add summary sheet if both exist
-        if expenses and income:
-            total_exp = df_expenses['amount'].sum()
-            total_inc = df_income['amount'].sum()
+        # Add summary sheet with more detailed breakdown
+        if expenses or income:
+            total_exp = sum(exp['amount'] for exp in expenses) if expenses else 0
+            total_inc = sum(inc['amount'] for inc in income) if income else 0
             net = total_inc - total_exp
             
+            # Create category breakdown
+            categories = {}
+            for exp in expenses:
+                category = exp['category']
+                if category not in categories:
+                    categories[category] = 0
+                categories[category] += exp['amount']
+            
+            # Summary data with categories
             summary_data = {
-                'Metric': ['Total Income', 'Total Expenses', 'Net Profit/Loss'],
-                'Amount': [total_inc, total_exp, net]
+                'Metric': ['Total Income', 'Total Expenses', 'Net Profit/Loss'] + list(categories.keys()),
+                'Amount': [total_inc, total_exp, net] + list(categories.values())
             }
+            
             df_summary = pd.DataFrame(summary_data)
             df_summary.to_excel(writer, index=False, sheet_name='Summary')
             ws_sum = writer.sheets['Summary']
             
             # Format net profit/loss
             ws_sum.cell(row=4, column=2).fill = PatternFill(
-                start_color="FFD700" if net >= 0 else "FF6347",
-                end_color="FFD700" if net >= 0 else "FF6347",
+                start_color="98FB98" if net >= 0 else "FF6347",
+                end_color="98FB98" if net >= 0 else "FF6347",
                 fill_type="solid"
             )
             
-            # Format headers
+            # Format headers and make them bold
             for cell in ws_sum[1]:
                 cell.font = Font(bold=True)
+            
+            # Format the category breakdown section header
+            if categories:
+                ws_sum.cell(row=4, column=1, value="Category Breakdown:").font = Font(bold=True)
 
         # Auto-adjust column widths
         for sheet in workbook.sheetnames:
             ws = workbook[sheet]
             for col in ws.columns:
                 max_length = max(len(str(cell.value)) for cell in col)
-                ws.column_dimensions[col[0].column_letter].width = max_length + 2
+                ws.column_dimensions[col[0].column_letter].width = max_length + 5
 
         writer.close()
         excel_binary.seek(0)
