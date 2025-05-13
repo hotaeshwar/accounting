@@ -43,6 +43,7 @@ app.add_middleware(
 )
 
 # Define expense categories
+# Define expense categories
 class ExpenseCategory(str, Enum):
     OFFICE_SUPPLIES = "Office Supplies"
     RENT = "Rent"
@@ -58,8 +59,10 @@ class ExpenseCategory(str, Enum):
     TELECOMMUNICATIONS = "Telecommunications"
     CONSULTING = "Consulting"
     LEGAL = "Legal"
+    PERSONAL_EXPENSES = "Personal Expenses"  # Added new category
+    FOOD = "Food"  # Added new category
+    EXPENSES_FOR_OTHER = "Expenses for Other"  # Added new category
     MISCELLANEOUS = "Miscellaneous"
-
 # Define user role
 class UserRole(str, Enum):
     ADMIN = "admin"
