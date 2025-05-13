@@ -61,7 +61,7 @@ class ExpenseCategory(str, Enum):
     LEGAL = "Legal"
     PERSONAL_EXPENSES = "Personal Expenses"  # Added new category
     FOOD = "Food"  # Added new category
-    EXPENSES_FOR_OTHER = "Expenses for Other"  # Added new category
+    EXPENSES_FOR_OTHER = " Food Expenses for Other"  # Added new category
     MISCELLANEOUS = "Miscellaneous"
 # Define user role
 class UserRole(str, Enum):
