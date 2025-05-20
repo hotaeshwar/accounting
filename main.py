@@ -736,7 +736,36 @@ async def create_expense(expense: ExpenseCreate, current_user: dict = Depends(ge
         )
     finally:
         conn.close()
+@app.get("/income/all", response_model=ResponseModel)
+async def list_all_income(current_user: dict = Depends(get_current_admin)):
+    conn = sqlite3.connect(DATABASE_NAME)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
 
+    try:
+        cursor.execute(
+            """
+            SELECT id, description, amount, date_created
+            FROM income
+            ORDER BY date_created DESC
+            """
+        )
+        income_entries = []
+        for row in cursor.fetchall():
+            income_entries.append(dict(row))
+
+        return {
+            "success": True, 
+            "data": income_entries,
+            "message": f"Retrieved {len(income_entries)} income entries"
+        }
+    except Exception as e:
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"success": False, "message": f"Database error: {str(e)}"}
+        )
+    finally:
+        conn.close()
 @app.get("/expenses/my", response_model=ResponseModel)
 async def list_my_expenses(current_user: dict = Depends(get_current_user)):
     conn = sqlite3.connect(DATABASE_NAME)
