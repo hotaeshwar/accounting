@@ -3,7 +3,7 @@ import string
 from fastapi import FastAPI, Depends, HTTPException, Response, status, Header, Request
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
-from typing import List, Optional, Dict, Any, Union
+from typing import List, Optional, Dict, Any, Union,Literal
 from enum import Enum
 from datetime import datetime, timedelta
 import sqlite3
@@ -192,6 +192,51 @@ class IncomeCreate(BaseModel):
     amount: float
 
 class ProfitLossData(BaseModel):
+    total_income: float
+    total_expenses: float
+    net_profit_loss: float
+    expenses_by_category: Dict[str, float]
+class ArchiveRequest(BaseModel):
+    year: int
+    month: int
+    confirm: bool = False
+
+class ArchiveResponse(BaseModel):
+    success: bool
+    message: str
+    archived_expenses_count: int
+    archived_income_count: int
+    archive_date: str
+
+class ProfitLossRequest(BaseModel):
+    period_type: Literal["monthly", "weekly", "quarterly"]
+    year: int
+    month: Optional[int] = None
+    quarter: Optional[int] = None
+    week: Optional[int] = None
+
+class WeeklyProfitLoss(BaseModel):
+    week_number: int
+    start_date: str
+    end_date: str
+    total_income: float
+    total_expenses: float
+    net_profit_loss: float
+    expenses_by_category: Dict[str, float]
+
+class MonthlyProfitLoss(BaseModel):
+    month: int
+    month_name: str
+    year: int
+    total_income: float
+    total_expenses: float
+    net_profit_loss: float
+    expenses_by_category: Dict[str, float]
+
+class QuarterlyProfitLoss(BaseModel):
+    quarter: int
+    year: int
+    months: List[str]
     total_income: float
     total_expenses: float
     net_profit_loss: float
@@ -498,9 +543,67 @@ def archive_financial_data(year, month):
     cursor.execute('''
         DELETE FROM income WHERE date_created BETWEEN ? AND ?
     ''', (start_date, end_date))
+def ensure_archive_tables():
+    """Create archived tables if they don't exist"""
+    conn = sqlite3.connect(DATABASE_NAME)
+    cursor = conn.cursor()
+    
+    # Create archived_expenses table
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS archived_expenses (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        invoice_id TEXT NOT NULL,
+        user_id INTEGER NOT NULL,
+        amount REAL NOT NULL,
+        category TEXT NOT NULL,
+        description TEXT,
+        date_created TEXT NOT NULL,
+        archive_date TEXT NOT NULL,
+        archive_expiry TEXT NOT NULL,
+        FOREIGN KEY (user_id) REFERENCES users (id)
+    )
+    ''')
+    
+    # Create archived_income table
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS archived_income (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        description TEXT,
+        amount REAL NOT NULL,
+        date_created TEXT NOT NULL,
+        archive_date TEXT NOT NULL,
+        archive_expiry TEXT NOT NULL
+    )
+    ''')
 
     conn.commit()
     conn.close()
+def get_week_date_range(year, week):
+    """Get start and end date for a specific week of the year"""
+    jan1 = datetime(year, 1, 1)
+    start_of_week = jan1 + timedelta(weeks=week-1)
+    # Adjust to Monday as start of week
+    start_of_week = start_of_week - timedelta(days=start_of_week.weekday())
+    end_of_week = start_of_week + timedelta(days=6)
+    return start_of_week, end_of_week
+
+def get_quarter_months(quarter):
+    """Get months for a specific quarter"""
+    quarters = {
+        1: [1, 2, 3],
+        2: [4, 5, 6], 
+        3: [7, 8, 9],
+        4: [10, 11, 12]
+    }
+    return quarters.get(quarter, [])
+
+def get_month_date_range(year, month):
+    """Get start and end date for a specific month"""
+    start_date = datetime(year, month, 1)
+    _, last_day = calendar.monthrange(year, month)
+    end_date = datetime(year, month, last_day, 23, 59, 59)
+    return start_date, end_date
+
 
 # API endpoints
 @app.post("/register", response_model=ResponseModel)
@@ -1068,6 +1171,471 @@ async def get_current_month_profit_loss(current_user: dict = Depends(get_current
         )
     finally:
         conn.close()
+@app.post("/archive/manual", response_model=ArchiveResponse)
+async def manual_archive_month(
+    archive_request: ArchiveRequest, 
+    current_user: dict = Depends(get_current_admin)
+):
+    """Manually archive expenses and income for a specific month"""
+    try:
+        year, month = archive_request.year, archive_request.month
+        
+        # Validate inputs
+        if month < 1 or month > 12:
+            return JSONResponse(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                content={"success": False, "message": "Invalid month. Must be between 1-12"}
+            )
+        
+        if year < 2000 or year > datetime.now().year:
+            return JSONResponse(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                content={"success": False, "message": f"Invalid year. Must be between 2000-{datetime.now().year}"}
+            )
+        
+        # Check if confirmation is provided for safety
+        if not archive_request.confirm:
+            return JSONResponse(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                content={
+                    "success": False, 
+                    "message": "Archive operation requires confirmation. Set 'confirm' to true."
+                }
+            )
+        
+        start_date, end_date = get_month_date_range(year, month)
+        start_date_str = start_date.strftime("%Y-%m-%d %H:%M:%S")
+        end_date_str = end_date.strftime("%Y-%m-%d %H:%M:%S")
+        
+        conn = sqlite3.connect(DATABASE_NAME)
+        cursor = conn.cursor()
+        
+        # Count records to be archived
+        cursor.execute(
+            "SELECT COUNT(*) FROM expenses WHERE date_created BETWEEN ? AND ?",
+            (start_date_str, end_date_str)
+        )
+        expense_count = cursor.fetchone()[0]
+        
+        cursor.execute(
+            "SELECT COUNT(*) FROM income WHERE date_created BETWEEN ? AND ?", 
+            (start_date_str, end_date_str)
+        )
+        income_count = cursor.fetchone()[0]
+        
+        if expense_count == 0 and income_count == 0:
+            conn.close()
+            return {
+                "success": False,
+                "message": f"No data found for {calendar.month_name[month]} {year}",
+                "archived_expenses_count": 0,
+                "archived_income_count": 0,
+                "archive_date": ""
+            }
+        
+        archive_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        archive_expiry = (datetime.now() + timedelta(days=ARCHIVE_RETENTION_DAYS)).strftime("%Y-%m-%d %H:%M:%S")
+        
+        # Archive expenses
+        if expense_count > 0:
+            cursor.execute('''
+                INSERT INTO archived_expenses
+                (invoice_id, user_id, amount, category, description, date_created, archive_date, archive_expiry)
+                SELECT invoice_id, user_id, amount, category, description, date_created, ?, ?
+                FROM expenses
+                WHERE date_created BETWEEN ? AND ?
+            ''', (archive_date, archive_expiry, start_date_str, end_date_str))
+            
+            cursor.execute(
+                "DELETE FROM expenses WHERE date_created BETWEEN ? AND ?",
+                (start_date_str, end_date_str)
+            )
+        
+        # Archive income
+        if income_count > 0:
+            cursor.execute('''
+                INSERT INTO archived_income
+                (description, amount, date_created, archive_date, archive_expiry)
+                SELECT description, amount, date_created, ?, ?
+                FROM income
+                WHERE date_created BETWEEN ? AND ?
+            ''', (archive_date, archive_expiry, start_date_str, end_date_str))
+            
+            cursor.execute(
+                "DELETE FROM income WHERE date_created BETWEEN ? AND ?",
+                (start_date_str, end_date_str)
+            )
+        
+        conn.commit()
+        conn.close()
+        
+        return {
+            "success": True,
+            "message": f"Successfully archived data for {calendar.month_name[month]} {year}",
+            "archived_expenses_count": expense_count,
+            "archived_income_count": income_count,
+            "archive_date": archive_date
+        }
+        
+    except Exception as e:
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"success": False, "message": f"Archive operation failed: {str(e)}"}
+        )
+
+# DOWNLOAD PREVIOUS MONTH EXCEL
+@app.get("/download/previous-month")
+async def download_previous_month_excel(current_user: dict = Depends(get_current_admin)):
+    """Download Excel file for previous month's data"""
+    try:
+        current_date = datetime.now()
+        previous_month_date = current_date.replace(day=1) - timedelta(days=1)
+        
+        excel_data, filename, total_expenses, total_income, net_amount = export_expenses_to_excel_stream(
+            previous_month_date.year, previous_month_date.month
+        )
+        
+        if excel_data is None:
+            return JSONResponse(
+                status_code=status.HTTP_404_NOT_FOUND,
+                content={"success": False, "message": "No data found for previous month"}
+            )
+        
+        return Response(
+            content=excel_data,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f"attachment; filename={filename}"}
+        )
+        
+    except Exception as e:
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"success": False, "message": f"Download failed: {str(e)}"}
+        )
+
+# DOWNLOAD SPECIFIC MONTH EXCEL
+@app.get("/download/{year}/{month}")
+async def download_month_excel(
+    year: int, 
+    month: int, 
+    current_user: dict = Depends(get_current_admin)
+):
+    """Download Excel file for specific month's data"""
+    try:
+        # Validate inputs
+        if month < 1 or month > 12:
+            return JSONResponse(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                content={"success": False, "message": "Invalid month. Must be between 1-12"}
+            )
+        
+        if year < 2000 or year > datetime.now().year:
+            return JSONResponse(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                content={"success": False, "message": f"Invalid year. Must be between 2000-{datetime.now().year}"}
+            )
+        
+        excel_data, filename, total_expenses, total_income, net_amount = export_expenses_to_excel_stream(year, month)
+        
+        if excel_data is None:
+            return JSONResponse(
+                status_code=status.HTTP_404_NOT_FOUND,
+                content={"success": False, "message": f"No data found for {calendar.month_name[month]} {year}"}
+            )
+        
+        return Response(
+            content=excel_data,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f"attachment; filename={filename}"}
+        )
+        
+    except Exception as e:
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"success": False, "message": f"Download failed: {str(e)}"}
+        )
+
+# MONTHLY PROFIT & LOSS
+@app.get("/profit-loss/monthly/{year}/{month}", response_model=ResponseModel)
+async def get_monthly_profit_loss(
+    year: int, 
+    month: int, 
+    current_user: dict = Depends(get_current_user)
+):
+    """Get profit and loss data for a specific month"""
+    try:
+        if month < 1 or month > 12:
+            return JSONResponse(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                content={"success": False, "message": "Invalid month. Must be between 1-12"}
+            )
+        
+        start_date, end_date = get_month_date_range(year, month)
+        start_date_str = start_date.strftime("%Y-%m-%d %H:%M:%S")
+        end_date_str = end_date.strftime("%Y-%m-%d %H:%M:%S")
+        
+        conn = sqlite3.connect(DATABASE_NAME)
+        cursor = conn.cursor()
+        
+        # Get total income
+        cursor.execute(
+            "SELECT SUM(amount) FROM income WHERE date_created BETWEEN ? AND ?",
+            (start_date_str, end_date_str)
+        )
+        total_income = cursor.fetchone()[0] or 0.0
+        
+        # Get total expenses
+        cursor.execute(
+            "SELECT SUM(amount) FROM expenses WHERE date_created BETWEEN ? AND ?",
+            (start_date_str, end_date_str)
+        )
+        total_expenses = cursor.fetchone()[0] or 0.0
+        
+        # Get expenses by category
+        expenses_by_category = {}
+        for category in ExpenseCategory:
+            cursor.execute(
+                "SELECT SUM(amount) FROM expenses WHERE category = ? AND date_created BETWEEN ? AND ?",
+                (category.value, start_date_str, end_date_str)
+            )
+            category_total = cursor.fetchone()[0] or 0.0
+            expenses_by_category[category.value] = category_total
+        
+        conn.close()
+        
+        monthly_data = {
+            "month": month,
+            "month_name": calendar.month_name[month],
+            "year": year,
+            "total_income": total_income,
+            "total_expenses": total_expenses,
+            "net_profit_loss": total_income - total_expenses,
+            "expenses_by_category": expenses_by_category
+        }
+        
+        return {
+            "success": True,
+            "data": monthly_data,
+            "message": f"Monthly profit/loss data for {calendar.month_name[month]} {year}"
+        }
+        
+    except Exception as e:
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"success": False, "message": f"Error retrieving monthly data: {str(e)}"}
+        )
+
+# WEEKLY PROFIT & LOSS
+@app.get("/profit-loss/weekly/{year}/{week}", response_model=ResponseModel)
+async def get_weekly_profit_loss(
+    year: int, 
+    week: int, 
+    current_user: dict = Depends(get_current_user)
+):
+    """Get profit and loss data for a specific week"""
+    try:
+        if week < 1 or week > 53:
+            return JSONResponse(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                content={"success": False, "message": "Invalid week. Must be between 1-53"}
+            )
+        
+        start_date, end_date = get_week_date_range(year, week)
+        start_date_str = start_date.strftime("%Y-%m-%d %H:%M:%S")
+        end_date_str = end_date.strftime("%Y-%m-%d %H:%M:%S")
+        
+        conn = sqlite3.connect(DATABASE_NAME)
+        cursor = conn.cursor()
+        
+        # Get total income
+        cursor.execute(
+            "SELECT SUM(amount) FROM income WHERE date_created BETWEEN ? AND ?",
+            (start_date_str, end_date_str)
+        )
+        total_income = cursor.fetchone()[0] or 0.0
+        
+        # Get total expenses
+        cursor.execute(
+            "SELECT SUM(amount) FROM expenses WHERE date_created BETWEEN ? AND ?",
+            (start_date_str, end_date_str)
+        )
+        total_expenses = cursor.fetchone()[0] or 0.0
+        
+        # Get expenses by category
+        expenses_by_category = {}
+        for category in ExpenseCategory:
+            cursor.execute(
+                "SELECT SUM(amount) FROM expenses WHERE category = ? AND date_created BETWEEN ? AND ?",
+                (category.value, start_date_str, end_date_str)
+            )
+            category_total = cursor.fetchone()[0] or 0.0
+            expenses_by_category[category.value] = category_total
+        
+        conn.close()
+        
+        weekly_data = {
+            "week_number": week,
+            "start_date": start_date.strftime("%Y-%m-%d"),
+            "end_date": end_date.strftime("%Y-%m-%d"),
+            "total_income": total_income,
+            "total_expenses": total_expenses,
+            "net_profit_loss": total_income - total_expenses,
+            "expenses_by_category": expenses_by_category
+        }
+        
+        return {
+            "success": True,
+            "data": weekly_data,
+            "message": f"Weekly profit/loss data for week {week} of {year}"
+        }
+        
+    except Exception as e:
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"success": False, "message": f"Error retrieving weekly data: {str(e)}"}
+        )
+
+# QUARTERLY PROFIT & LOSS
+@app.get("/profit-loss/quarterly/{year}/{quarter}", response_model=ResponseModel)
+async def get_quarterly_profit_loss(
+    year: int, 
+    quarter: int, 
+    current_user: dict = Depends(get_current_user)
+):
+    """Get profit and loss data for a specific quarter"""
+    try:
+        if quarter < 1 or quarter > 4:
+            return JSONResponse(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                content={"success": False, "message": "Invalid quarter. Must be between 1-4"}
+            )
+        
+        quarter_months = get_quarter_months(quarter)
+        start_month = quarter_months[0]
+        end_month = quarter_months[-1]
+        
+        start_date = datetime(year, start_month, 1)
+        _, last_day = calendar.monthrange(year, end_month)
+        end_date = datetime(year, end_month, last_day, 23, 59, 59)
+        
+        start_date_str = start_date.strftime("%Y-%m-%d %H:%M:%S")
+        end_date_str = end_date.strftime("%Y-%m-%d %H:%M:%S")
+        
+        conn = sqlite3.connect(DATABASE_NAME)
+        cursor = conn.cursor()
+        
+        # Get total income
+        cursor.execute(
+            "SELECT SUM(amount) FROM income WHERE date_created BETWEEN ? AND ?",
+            (start_date_str, end_date_str)
+        )
+        total_income = cursor.fetchone()[0] or 0.0
+        
+        # Get total expenses
+        cursor.execute(
+            "SELECT SUM(amount) FROM expenses WHERE date_created BETWEEN ? AND ?",
+            (start_date_str, end_date_str)
+        )
+        total_expenses = cursor.fetchone()[0] or 0.0
+        
+        # Get expenses by category
+        expenses_by_category = {}
+        for category in ExpenseCategory:
+            cursor.execute(
+                "SELECT SUM(amount) FROM expenses WHERE category = ? AND date_created BETWEEN ? AND ?",
+                (category.value, start_date_str, end_date_str)
+            )
+            category_total = cursor.fetchone()[0] or 0.0
+            expenses_by_category[category.value] = category_total
+        
+        conn.close()
+        
+        quarterly_data = {
+            "quarter": quarter,
+            "year": year,
+            "months": [calendar.month_name[m] for m in quarter_months],
+            "total_income": total_income,
+            "total_expenses": total_expenses,
+            "net_profit_loss": total_income - total_expenses,
+            "expenses_by_category": expenses_by_category
+        }
+        
+        return {
+            "success": True,
+            "data": quarterly_data,
+            "message": f"Quarterly profit/loss data for Q{quarter} {year}"
+        }
+        
+    except Exception as e:
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"success": False, "message": f"Error retrieving quarterly data: {str(e)}"}
+        )
+
+# YEAR SUMMARY FOR ALL MONTHS
+@app.get("/profit-loss/year-summary/{year}", response_model=ResponseModel)
+async def get_year_summary(year: int, current_user: dict = Depends(get_current_user)):
+    """Get profit and loss summary for all months in a year"""
+    try:
+        year_summary = []
+        
+        for month in range(1, 13):
+            start_date, end_date = get_month_date_range(year, month)
+            start_date_str = start_date.strftime("%Y-%m-%d %H:%M:%S")
+            end_date_str = end_date.strftime("%Y-%m-%d %H:%M:%S")
+            
+            conn = sqlite3.connect(DATABASE_NAME)
+            cursor = conn.cursor()
+            
+            # Get monthly totals
+            cursor.execute(
+                "SELECT SUM(amount) FROM income WHERE date_created BETWEEN ? AND ?",
+                (start_date_str, end_date_str)
+            )
+            total_income = cursor.fetchone()[0] or 0.0
+            
+            cursor.execute(
+                "SELECT SUM(amount) FROM expenses WHERE date_created BETWEEN ? AND ?",
+                (start_date_str, end_date_str)
+            )
+            total_expenses = cursor.fetchone()[0] or 0.0
+            
+            conn.close()
+            
+            month_data = {
+                "month": month,
+                "month_name": calendar.month_name[month],
+                "total_income": total_income,
+                "total_expenses": total_expenses,
+                "net_profit_loss": total_income - total_expenses
+            }
+            year_summary.append(month_data)
+        
+        # Calculate year totals
+        year_income = sum(m["total_income"] for m in year_summary)
+        year_expenses = sum(m["total_expenses"] for m in year_summary)
+        year_net = year_income - year_expenses
+        
+        return {
+            "success": True,
+            "data": {
+                "year": year,
+                "monthly_summary": year_summary,
+                "year_totals": {
+                    "total_income": year_income,
+                    "total_expenses": year_expenses,
+                    "net_profit_loss": year_net
+                }
+            },
+            "message": f"Year summary for {year}"
+        }
+        
+    except Exception as e:
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"success": False, "message": f"Error retrieving year summary: {str(e)}"}
+        )
+
 # Health check endpoint
 @app.get("/health")
 async def health_check():
